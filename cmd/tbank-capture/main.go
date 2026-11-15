@@ -139,6 +139,8 @@ func run() error {
 		gen:       gen,
 		mgr:       mgr,
 		nav:       nav,
+		handler:   handler,
+		store:     store,
 	}
 
 	// Initialize Telegram bot controller
@@ -166,24 +168,16 @@ func run() error {
 	// --- Coordinated Graceful Shutdown Protocol ---
 	// Shutdown Order:
 	// 1. Handler deactivation: Stop accepting or enqueuing new network responses.
-	// 2. Browser shutdown: Close pages and context; terminate Chromium/Playwright.
-	// 3. Store queue draining: Close queue, drain accepted jobs, and terminate worker.
-	// 4. Session finalization: Stop active session, persist state, and generate report.
+	// 2. Session finalization: Flush barrier, process remaining accepted jobs, persist state, and generate report.
+	// 3. Browser shutdown: Close pages and context; terminate Chromium/Playwright.
+	// 4. Store shutdown: Close queue, drain worker, cancel context.
 	log.Info("graceful shutdown initiated")
 
 	// Step 1: Deactivate handler
 	handler.Deactivate()
 
-	// Step 2: Stop browser
-	mgr.Stop()
-
-	// Step 3: Stop store and drain remaining accepted jobs
-	store.Close()
-	store.Wait()
-	storeCancel()
-
-	// Step 4: Finalize active discovery session if one was running
-	if sess := collector.ActiveSession(); sess != nil && sess.Active {
+	// Step 2: Finalize active discovery session if one was running (before terminating store)
+	if sess := collector.ActiveSession(); sess != nil && (sess.Active || sess.State == discovery.SessionStateActive) {
 		log.Info("finalizing active discovery session on shutdown", "sessionID", sess.ID)
 		if mdPath, jsonPath, err := ctrl.StopDiscovery(); err != nil {
 			log.Warn("failed to generate final report on shutdown", "err", err)
@@ -191,6 +185,14 @@ func run() error {
 			log.Info("final report generated", "markdown", mdPath, "json", jsonPath)
 		}
 	}
+
+	// Step 3: Stop browser
+	mgr.Stop()
+
+	// Step 4: Stop store and terminate worker
+	store.Close()
+	store.Wait()
+	storeCancel()
 
 	log.Info("tbank-capture shutdown complete")
 	return nil
@@ -204,18 +206,23 @@ type controller struct {
 	gen       *discovery.Generator
 	mgr       *browser.Manager
 	nav       *browser.Navigator
+	handler   *capture.ResponseHandler
+	store     *capture.Store
 }
 
 func (c *controller) StartDiscovery() (discovery.SessionID, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if sess := c.collector.ActiveSession(); sess != nil && sess.Active {
+	if sess := c.collector.ActiveSession(); sess != nil && (sess.Active || sess.State == discovery.SessionStateActive) {
 		return sess.ID, fmt.Errorf("session already active: %s", sess.ID)
 	}
 
-	id := discovery.SessionID(fmt.Sprintf("sess-%s", time.Now().UTC().Format("20060102T150405Z")))
+	id := discovery.NewSessionID()
 	c.collector.StartSession(id)
+	if c.handler != nil {
+		c.handler.SetSessionID(id)
+	}
 	c.log.Info("discovery session started", "id", id)
 	return id, nil
 }
@@ -224,19 +231,45 @@ func (c *controller) StopDiscovery() (mdPath, jsonPath string, err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	sess := c.collector.StopSession()
-	if sess == nil {
+	sess := c.collector.ActiveSession()
+	if sess == nil || (!sess.Active && sess.State != discovery.SessionStateActive) {
 		return "", "", fmt.Errorf("no active session")
 	}
 
-	fps := c.collector.Fingerprints()
-	metrics := c.collector.Metrics()
+	sessionID := sess.ID
 
+	// 1. Stop handler from accepting any new jobs for this session
+	if c.handler != nil {
+		c.handler.StopSession(sessionID)
+	}
+
+	// 2. Mark session as stopping in collector to prevent new events while draining
+	if err := c.collector.BeginStopping(sessionID); err != nil {
+		c.log.Warn("begin stopping session failed", "err", err)
+	}
+
+	// 3. Flush accepted jobs through the store FIFO barrier
+	if c.store != nil {
+		flushCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := c.store.FlushSession(flushCtx, sessionID); err != nil {
+			c.log.Warn("flush session queue barrier returned", "err", err)
+		}
+	}
+
+	// 4. Finalize session, capturing immutable snapshots
+	sessCopy, fps, metrics, err := c.collector.FinalizeSession(sessionID)
+	if err != nil {
+		return "", "", fmt.Errorf("finalize session: %w", err)
+	}
+
+	// 5. Persist session state to disk
 	if err := c.collector.PersistSession(); err != nil {
 		c.log.Warn("persist session failed", "err", err)
 	}
 
-	mdPath, jsonPath, err = c.gen.Generate(sess, fps, metrics)
+	// 6. Generate Markdown and JSON reports
+	mdPath, jsonPath, err = c.gen.Generate(sessCopy, fps, metrics)
 	if err != nil {
 		return "", "", fmt.Errorf("generate report: %w", err)
 	}

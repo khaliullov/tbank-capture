@@ -28,8 +28,14 @@ type Report struct {
 
 // ReportSummary holds aggregate telemetry and discovery candidate counts.
 type ReportSummary struct {
-	TotalObserved         int `json:"total_observed"`
-	EligibleResponses     int `json:"eligible_responses"`
+	Observed              int `json:"observed"`
+	Filtered              int `json:"filtered"`
+	Eligible              int `json:"eligible"`
+	Enqueued              int `json:"enqueued"`
+	Processed             int `json:"processed"`
+	Dropped               int `json:"dropped"`
+	CaptureFailed         int `json:"capture_failed"`
+	QueueOverflow         int `json:"queue_overflow"`
 	UniqueFingerprints    int `json:"unique_fingerprints"`
 	TransactionCandidates int `json:"transaction_candidates"`
 	AccountCandidates     int `json:"account_candidates"`
@@ -38,8 +44,12 @@ type ReportSummary struct {
 	PaymentCandidates     int `json:"payment_candidates"`
 	TransferCandidates    int `json:"transfer_candidates"`
 	StatementCandidates   int `json:"statement_candidates"`
-	CaptureFailures       int `json:"capture_failures"`
-	QueueOverflows        int `json:"queue_overflows"`
+
+	// Legacy aliases
+	TotalObserved     int `json:"total_observed"`
+	EligibleResponses int `json:"eligible_responses"`
+	CaptureFailures   int `json:"capture_failures"`
+	QueueOverflows    int `json:"queue_overflows"`
 }
 
 // Generator produces Markdown and JSON reports from collected fingerprints.
@@ -92,22 +102,53 @@ func buildReport(sess *Session, fps []*EndpointFingerprint, metrics Metrics, now
 		finished = now
 	}
 
+	queueOverflow := metrics.QueueOverflow
+	if queueOverflow == 0 && metrics.QueueOverflows > 0 {
+		queueOverflow = metrics.QueueOverflows
+	}
+	captureFailed := metrics.CaptureFailed
+	if captureFailed == 0 && metrics.CaptureFailures > 0 {
+		captureFailed = metrics.CaptureFailures
+	}
+	observed := metrics.Observed
+	if observed == 0 && metrics.TotalObserved > 0 {
+		observed = metrics.TotalObserved
+	}
+	eligible := metrics.Eligible
+	if eligible == 0 && metrics.EligibleResponses > 0 {
+		eligible = metrics.EligibleResponses
+	}
+	filtered := metrics.Filtered
+	if filtered == 0 && metrics.IgnoredResponses > 0 {
+		filtered = metrics.IgnoredResponses
+	}
+
 	summary := ReportSummary{
-		TotalObserved:      metrics.TotalObserved,
-		EligibleResponses:  metrics.EligibleResponses,
+		Observed:           observed,
+		Filtered:           filtered,
+		Eligible:           eligible,
+		Enqueued:           metrics.Enqueued,
+		Processed:          metrics.Processed,
+		Dropped:            metrics.Dropped,
+		CaptureFailed:      captureFailed,
+		QueueOverflow:      queueOverflow,
 		UniqueFingerprints: len(fps),
-		CaptureFailures:    metrics.CaptureFailures,
-		QueueOverflows:     metrics.QueueOverflows,
+
+		// Legacy aliases
+		TotalObserved:     observed,
+		EligibleResponses: eligible,
+		CaptureFailures:   captureFailed,
+		QueueOverflows:    queueOverflow,
 	}
 
 	var candidates, unknown []EndpointFingerprint
 	var sessionWarnings []string
 
-	if metrics.QueueOverflows > 0 {
-		sessionWarnings = append(sessionWarnings, fmt.Sprintf("Capture queue overflowed %d time(s); some responses were dropped", metrics.QueueOverflows))
+	if queueOverflow > 0 {
+		sessionWarnings = append(sessionWarnings, fmt.Sprintf("Capture queue overflowed %d time(s); %d eligible responses were dropped", queueOverflow, queueOverflow))
 	}
-	if metrics.CaptureFailures > 0 {
-		sessionWarnings = append(sessionWarnings, fmt.Sprintf("%d response(s) failed body retrieval or exceeded size limit", metrics.CaptureFailures))
+	if captureFailed > 0 {
+		sessionWarnings = append(sessionWarnings, fmt.Sprintf("%d response(s) failed body retrieval or exceeded size limit", captureFailed))
 	}
 
 	for _, fp := range fps {
@@ -182,8 +223,15 @@ func renderMarkdown(r Report) string {
 	sb.WriteString(fmt.Sprintf("Generated: %s  \n\n", r.GeneratedAt.Format(time.RFC3339)))
 
 	sb.WriteString("## Summary\n\n")
-	sb.WriteString(fmt.Sprintf("- Total observed responses: %d\n", r.Summary.TotalObserved))
-	sb.WriteString(fmt.Sprintf("- Eligible JSON responses: %d\n", r.Summary.EligibleResponses))
+	sb.WriteString(fmt.Sprintf("- Total observed responses: %d\n", r.Summary.Observed))
+	sb.WriteString(fmt.Sprintf("- Filtered responses: %d\n", r.Summary.Filtered))
+	sb.WriteString(fmt.Sprintf("- Eligible JSON responses: %d\n", r.Summary.Eligible))
+	sb.WriteString(fmt.Sprintf("- Enqueued responses: %d\n", r.Summary.Enqueued))
+	sb.WriteString(fmt.Sprintf("- Processed responses: %d\n", r.Summary.Processed))
+	sb.WriteString(fmt.Sprintf("- Dropped responses: %d (Queue overflows: %d)\n", r.Summary.Dropped, r.Summary.QueueOverflow))
+	if r.Summary.CaptureFailed > 0 {
+		sb.WriteString(fmt.Sprintf("- Capture failures: %d\n", r.Summary.CaptureFailed))
+	}
 	sb.WriteString(fmt.Sprintf("- Unique endpoint fingerprints: %d\n", r.Summary.UniqueFingerprints))
 	sb.WriteString(fmt.Sprintf("- Transaction candidates: %d\n", r.Summary.TransactionCandidates))
 	sb.WriteString(fmt.Sprintf("- Account candidates: %d\n", r.Summary.AccountCandidates))
@@ -191,14 +239,7 @@ func renderMarkdown(r Report) string {
 	sb.WriteString(fmt.Sprintf("- Balance candidates: %d\n", r.Summary.BalanceCandidates))
 	sb.WriteString(fmt.Sprintf("- Payment candidates: %d\n", r.Summary.PaymentCandidates))
 	sb.WriteString(fmt.Sprintf("- Transfer candidates: %d\n", r.Summary.TransferCandidates))
-	sb.WriteString(fmt.Sprintf("- Statement candidates: %d\n", r.Summary.StatementCandidates))
-	if r.Summary.CaptureFailures > 0 {
-		sb.WriteString(fmt.Sprintf("- Capture failures: %d\n", r.Summary.CaptureFailures))
-	}
-	if r.Summary.QueueOverflows > 0 {
-		sb.WriteString(fmt.Sprintf("- Queue overflows: %d\n", r.Summary.QueueOverflows))
-	}
-	sb.WriteString("\n")
+	sb.WriteString(fmt.Sprintf("- Statement candidates: %d\n\n", r.Summary.StatementCandidates))
 
 	if len(r.Candidates) > 0 {
 		sb.WriteString("## Endpoint Candidates\n\n")

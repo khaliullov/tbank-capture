@@ -20,7 +20,7 @@ type JobSubmitter interface {
 }
 
 // Store manages a bounded capture queue and persists raw responses to disk if enabled.
-// It implements an explicit, thread-safe shutdown protocol.
+// It implements an explicit, thread-safe shutdown protocol and per-session completion barriers.
 type Store struct {
 	log        *slog.Logger
 	rawDir     string
@@ -79,6 +79,47 @@ func (s *Store) Submit(job discovery.CaptureJob) bool {
 	}
 }
 
+// FlushSession enqueues a deterministic completion barrier for sessionID and blocks until
+// all capture jobs queued prior to this barrier have been fully processed by the worker.
+// The Store and worker remain operational to service future discovery sessions.
+func (s *Store) FlushSession(ctx context.Context, sessionID discovery.SessionID) error {
+	s.mu.RLock()
+	if s.closed {
+		s.mu.RUnlock()
+		return fmt.Errorf("store closed")
+	}
+
+	barrierDone := make(chan struct{})
+	barrierJob := discovery.CaptureJob{
+		SessionID:   sessionID,
+		IsBarrier:   true,
+		BarrierDone: barrierDone,
+	}
+
+	// Submit barrier to the FIFO queue.
+	// We wait for a free slot or context cancellation.
+	select {
+	case s.queue <- barrierJob:
+		s.mu.RUnlock()
+	case <-ctx.Done():
+		s.mu.RUnlock()
+		return ctx.Err()
+	case <-s.done:
+		s.mu.RUnlock()
+		return fmt.Errorf("store terminated")
+	}
+
+	// Wait for the worker to process all preceding jobs and reach this barrier.
+	select {
+	case <-barrierDone:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.done:
+		return fmt.Errorf("store terminated before barrier completed")
+	}
+}
+
 // Close stops accepting new capture jobs and closes the internal queue channel.
 // It is idempotent and safe for concurrent calls.
 func (s *Store) Close() {
@@ -102,6 +143,12 @@ func (s *Store) Run(ctx context.Context) {
 				s.log.Info("store worker drained queue and finished normally")
 				return
 			}
+			if job.IsBarrier {
+				if job.BarrierDone != nil {
+					close(job.BarrierDone)
+				}
+				continue
+			}
 			s.process(job)
 
 		case <-ctx.Done():
@@ -114,9 +161,15 @@ func (s *Store) Run(ctx context.Context) {
 					if !ok {
 						return
 					}
+					if job.IsBarrier {
+						if job.BarrierDone != nil {
+							close(job.BarrierDone)
+						}
+						continue
+					}
 					s.droppedCount.Add(1)
 					if s.collector != nil {
-						s.collector.IncrIgnored()
+						s.collector.IncrDroppedInQueue()
 					}
 					s.log.Warn("job dropped due to worker cancellation", "url", NormalizedURL(job.URL))
 				default:

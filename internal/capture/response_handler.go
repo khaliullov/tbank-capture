@@ -35,12 +35,13 @@ func (s *defaultChanSubmitter) Submit(job discovery.CaptureJob) bool {
 // Application-level Content-Length and body size checks protect Go process memory and capture storage,
 // but cannot enforce a strict upper bound on Chromium's internal memory footprint.
 type ResponseHandler struct {
-	log       *slog.Logger
-	filter    *Filter
-	submitter JobSubmitter
-	collector *discovery.Collector
-	sessionID func() discovery.SessionID
-	maxBody   int64
+	log             *slog.Logger
+	filter          *Filter
+	submitter       JobSubmitter
+	collector       *discovery.Collector
+	sessionID       func() discovery.SessionID
+	activeSessionID discovery.SessionID
+	maxBody         int64
 
 	mu     sync.RWMutex
 	active bool
@@ -48,7 +49,7 @@ type ResponseHandler struct {
 	// Metrics counters
 	countObserved  atomic.Int64
 	countEligible  atomic.Int64
-	countIgnored   atomic.Int64
+	countFiltered  atomic.Int64
 	countQueueFull atomic.Int64
 }
 
@@ -84,11 +85,29 @@ func (h *ResponseHandler) SetSubmitter(sub JobSubmitter) {
 	h.mu.Unlock()
 }
 
+// SetSessionID sets the active session ID for discovery capture.
+func (h *ResponseHandler) SetSessionID(id discovery.SessionID) {
+	h.mu.Lock()
+	h.activeSessionID = id
+	h.mu.Unlock()
+}
+
+// StopSession halts capture for the specified sessionID synchronously, ensuring
+// no new jobs for that session can be enqueued.
+func (h *ResponseHandler) StopSession(sessionID discovery.SessionID) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.activeSessionID == sessionID {
+		h.activeSessionID = ""
+	}
+}
+
 // Deactivate stops the handler from accepting or enqueueing any new responses.
 // After Deactivate returns, no callbacks will send into the queue.
 func (h *ResponseHandler) Deactivate() {
 	h.mu.Lock()
 	h.active = false
+	h.activeSessionID = ""
 	h.mu.Unlock()
 	h.log.Debug("response handler deactivated")
 }
@@ -113,14 +132,24 @@ func (h *ResponseHandler) HandleResponse(resp pw.Response) {
 	defer h.mu.RUnlock()
 
 	if !h.active {
-		h.countIgnored.Add(1)
+		h.countFiltered.Add(1)
 		return
 	}
 
 	h.countObserved.Add(1)
-	sessID := h.sessionID()
+	if h.collector != nil {
+		h.collector.IncrObserved()
+	}
+
+	sessID := h.activeSessionID
+	if sessID == "" && h.sessionID != nil {
+		sessID = h.sessionID()
+	}
 	if sessID == "" {
-		h.countIgnored.Add(1)
+		h.countFiltered.Add(1)
+		if h.collector != nil {
+			h.collector.IncrFiltered()
+		}
 		return
 	}
 
@@ -128,13 +157,19 @@ func (h *ResponseHandler) HandleResponse(resp pw.Response) {
 
 	// 1. Domain filter
 	if !h.filter.EligibleURL(rawURL) {
-		h.countIgnored.Add(1)
+		h.countFiltered.Add(1)
+		if h.collector != nil {
+			h.collector.IncrFiltered()
+		}
 		return
 	}
 
 	// 2. Auth path filter
 	if !h.filter.EligiblePath(rawURL) {
-		h.countIgnored.Add(1)
+		h.countFiltered.Add(1)
+		if h.collector != nil {
+			h.collector.IncrFiltered()
+		}
 		h.log.Debug("excluded auth path", "url", NormalizedURL(rawURL))
 		return
 	}
@@ -143,7 +178,10 @@ func (h *ResponseHandler) HandleResponse(resp pw.Response) {
 	req := resp.Request()
 	resourceType := strings.ToLower(strings.TrimSpace(req.ResourceType()))
 	if !h.filter.EligibleResourceType(resourceType) {
-		h.countIgnored.Add(1)
+		h.countFiltered.Add(1)
+		if h.collector != nil {
+			h.collector.IncrFiltered()
+		}
 		return
 	}
 
@@ -151,7 +189,10 @@ func (h *ResponseHandler) HandleResponse(resp pw.Response) {
 	headers := resp.Headers()
 	contentType := headers["content-type"]
 	if !h.filter.EligibleContentType(contentType) {
-		h.countIgnored.Add(1)
+		h.countFiltered.Add(1)
+		if h.collector != nil {
+			h.collector.IncrFiltered()
+		}
 		return
 	}
 
@@ -198,7 +239,10 @@ func (h *ResponseHandler) HandleResponse(resp pw.Response) {
 		} else {
 			// Inspect for authentication secrets conservatively
 			if ContainsAuthSecret(body) {
-				h.countIgnored.Add(1)
+				h.countFiltered.Add(1)
+				if h.collector != nil {
+					h.collector.IncrFiltered()
+				}
 				h.log.Debug("excluded: auth secret detected in response body", "url", NormalizedURL(rawURL))
 				return
 			}
@@ -208,10 +252,17 @@ func (h *ResponseHandler) HandleResponse(resp pw.Response) {
 	}
 
 	h.countEligible.Add(1)
+	if h.collector != nil {
+		h.collector.IncrEligible()
+	}
 
 	// Enqueue job via submitter
 	if h.submitter != nil {
-		if !h.submitter.Submit(job) {
+		if h.submitter.Submit(job) {
+			if h.collector != nil {
+				h.collector.IncrEnqueued()
+			}
+		} else {
 			h.countQueueFull.Add(1)
 			if h.collector != nil {
 				h.collector.IncrQueueOverflow()
@@ -229,8 +280,11 @@ func (h *ResponseHandler) CountObserved() int64 { return h.countObserved.Load() 
 // CountEligible returns eligible responses attempted.
 func (h *ResponseHandler) CountEligible() int64 { return h.countEligible.Load() }
 
-// CountIgnored returns ignored responses count.
-func (h *ResponseHandler) CountIgnored() int64 { return h.countIgnored.Load() }
+// CountFiltered returns filtered responses count.
+func (h *ResponseHandler) CountFiltered() int64 { return h.countFiltered.Load() }
+
+// CountIgnored is a backward-compatible alias for CountFiltered.
+func (h *ResponseHandler) CountIgnored() int64 { return h.countFiltered.Load() }
 
 // CountQueueFull returns queue overflow count.
 func (h *ResponseHandler) CountQueueFull() int64 { return h.countQueueFull.Load() }

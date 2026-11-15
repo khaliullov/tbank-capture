@@ -122,15 +122,12 @@ func (b *Bot) handleStatus(c tele.Context) error {
 		sb.WriteString(fmt.Sprintf("Session ID: `%s`\n", st.SessionID))
 		sb.WriteString(fmt.Sprintf("Started: %s\n", st.SessionStart.Format(time.RFC3339)))
 		m := st.Metrics
-		sb.WriteString(fmt.Sprintf("Observed: %d | Eligible: %d | Fingerprints: %d\n",
-			m.TotalObserved, m.EligibleResponses, m.UniqueFingerprints))
-		sb.WriteString(fmt.Sprintf("Transaction candidates: %d\n", m.TransactionCandidates))
-		if m.CaptureFailures > 0 {
-			sb.WriteString(fmt.Sprintf("Capture failures: %d\n", m.CaptureFailures))
-		}
-		if m.QueueOverflows > 0 {
-			sb.WriteString(fmt.Sprintf("⚠️ Queue overflows: %d\n", m.QueueOverflows))
-		}
+		sb.WriteString(fmt.Sprintf("Observed: %d | Filtered: %d | Eligible: %d | Processed: %d\n",
+			m.Observed, m.Filtered, m.Eligible, m.Processed))
+		sb.WriteString(fmt.Sprintf("Dropped: %d (Queue overflow: %d) | Failed: %d\n",
+			m.Dropped, m.QueueOverflow, m.CaptureFailed))
+		sb.WriteString(fmt.Sprintf("Fingerprints: %d | Transaction candidates: %d\n",
+			m.UniqueFingerprints, m.TransactionCandidates))
 	} else {
 		sb.WriteString("No active session. Use /discovery_start to begin.")
 	}
@@ -170,12 +167,28 @@ func (b *Bot) handleReport(c tele.Context) error {
 }
 
 // Start begins polling in a background goroutine and stops cleanly when ctx is cancelled.
+// It ensures that shutdown waits for the Telegram poller goroutine to terminate cleanly
+// using telebot's lifecycle guarantees, avoiding shutdown deadlocks.
 func (b *Bot) Start(ctx context.Context) {
-	b.log.Info("telegram bot poller started")
-	go b.bot.Start()
-	<-ctx.Done()
-	b.bot.Stop()
-	b.log.Info("telegram bot poller stopped")
+	b.log.Info("telegram bot poller starting")
+	pollerDone := make(chan struct{})
+	go func() {
+		defer close(pollerDone)
+		b.bot.Start()
+	}()
+
+	select {
+	case <-pollerDone:
+		b.log.Warn("telegram poller exited prematurely")
+	case <-ctx.Done():
+		b.bot.Stop()
+		select {
+		case <-pollerDone:
+			b.log.Info("telegram bot poller stopped")
+		case <-time.After(3 * time.Second):
+			b.log.Warn("telegram bot poller did not terminate within timeout; continuing shutdown")
+		}
+	}
 }
 
 // Send sends a plain text notification to the authorized chat ID. Never send financial data.

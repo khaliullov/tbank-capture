@@ -2,10 +2,26 @@
 // classification, and report generation for the network discovery mode.
 package discovery
 
-import "time"
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
+	"time"
+)
 
 // SessionID is a unique identifier for a discovery session.
 type SessionID string
+
+// NewSessionID generates a collision-resistant SessionID combining a UTC timestamp
+// with a cryptographic random hex suffix, preserving readable filenames.
+func NewSessionID() SessionID {
+	var b [4]byte
+	_, _ = rand.Read(b[:])
+	return SessionID(fmt.Sprintf("sess-%s-%s",
+		time.Now().UTC().Format("20060102T150405Z"),
+		hex.EncodeToString(b[:]),
+	))
+}
 
 // FingerprintID is a stable identifier for an endpoint family.
 type FingerprintID string
@@ -111,23 +127,61 @@ type CaptureJob struct {
 	BodySize     int64
 	BodyError    string // set if body retrieval failed
 	HasDateParam bool
+
+	// Barrier coordination
+	IsBarrier   bool
+	BarrierDone chan struct{}
 }
+
+// SessionState indicates the lifecycle phase of a discovery session.
+type SessionState string
+
+const (
+	SessionStateActive   SessionState = "active"
+	SessionStateStopping SessionState = "stopping"
+	SessionStateStopped  SessionState = "stopped"
+)
 
 // Session describes a single discovery session.
 type Session struct {
-	ID        SessionID `json:"id"`
-	StartedAt time.Time `json:"started_at"`
-	StoppedAt time.Time `json:"stopped_at,omitempty"`
-	Active    bool      `json:"active"`
+	ID        SessionID    `json:"id"`
+	StartedAt time.Time    `json:"started_at"`
+	StoppedAt time.Time    `json:"stopped_at,omitempty"`
+	State     SessionState `json:"state"`
+	Active    bool         `json:"active"`
 }
 
-// Metrics holds counters for discovery runtime telemetry.
+// Metrics holds unified counters for discovery runtime telemetry.
+//
+// Invariants:
+//
+//	Observed == Filtered + Eligible
+//	Eligible == Enqueued + QueueOverflow
+//	Enqueued == Processed + DroppedInQueue
+//	Dropped == QueueOverflow + DroppedInQueue
+//	Observed == Filtered + Processed + Dropped
 type Metrics struct {
-	TotalObserved         int `json:"total_observed"`
-	EligibleResponses     int `json:"eligible_responses"`
-	IgnoredResponses      int `json:"ignored_responses"`
-	CaptureFailures       int `json:"capture_failures"`
-	QueueOverflows        int `json:"queue_overflows"`
+	Observed              int `json:"observed"`
+	Filtered              int `json:"filtered"`
+	Eligible              int `json:"eligible"`
+	Enqueued              int `json:"enqueued"`
+	Processed             int `json:"processed"`
+	Dropped               int `json:"dropped"`
+	CaptureFailed         int `json:"capture_failed"`
+	QueueOverflow         int `json:"queue_overflow"`
 	UniqueFingerprints    int `json:"unique_fingerprints"`
 	TransactionCandidates int `json:"transaction_candidates"`
+	AccountCandidates     int `json:"account_candidates"`
+	CardCandidates        int `json:"card_candidates"`
+	BalanceCandidates     int `json:"balance_candidates"`
+	PaymentCandidates     int `json:"payment_candidates"`
+	TransferCandidates    int `json:"transfer_candidates"`
+	StatementCandidates   int `json:"statement_candidates"`
+
+	// Legacy aliases for backward compatibility with older consumers
+	TotalObserved     int `json:"total_observed"`
+	EligibleResponses int `json:"eligible_responses"`
+	IgnoredResponses  int `json:"ignored_responses"`
+	CaptureFailures   int `json:"capture_failures"`
+	QueueOverflows    int `json:"queue_overflows"`
 }

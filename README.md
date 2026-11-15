@@ -67,14 +67,23 @@ When `tbank-capture` launches, it executes the following 12-step initialization 
 
 If any step during startup fails, all already-acquired resources (browser context, Playwright runtime, store worker) are safely cleaned up before exiting.
 
-### Shutdown Protocol
+### Shutdown & Session Lifecycle Protocol
 
-To ensure data integrity and prevent channel panics or silent loss of jobs, the shutdown protocol follows a strict four-stage ordering:
+To ensure data integrity, prevent race conditions, and guarantee zero data loss of accepted capture jobs, `tbank-capture` implements deterministic session completion barriers:
 
-1. **Handler Deactivation**: `handler.Deactivate()` stops accepting new HTTP responses and blocks any new enqueue attempts.
-2. **Browser Shutdown**: `mgr.Stop()` closes browser pages, contexts, and Playwright. No further Chromium events can fire.
-3. **Store Queue Draining**: `store.Close()` closes the channel, and `store.Wait()` allows the worker to process all remaining accepted jobs.
-4. **Session Finalization**: If a discovery session was active, `ctrl.StopDiscovery()` stops the session, writes session state, and outputs the final reports.
+1. **Per-Session Completion Barrier (`StopDiscovery`)**:
+   - `handler.StopSession(sessionID)`: Synchronously halts new responses for this session.
+   - `collector.BeginStopping(sessionID)`: Transitions session state to `stopping`, allowing pending queued jobs for this session to be processed while rejecting all other events.
+   - `store.FlushSession(ctx, sessionID)`: Enqueues an explicit FIFO barrier job into the capture queue and blocks until the worker pops the barrier, guaranteeing all jobs accepted prior to the barrier have been processed.
+   - `collector.FinalizeSession(sessionID)`: Transitions session state to `stopped`, snapshots immutable fingerprints and metrics, and persists session JSON.
+   - Reports (Markdown & JSON) are generated from the consistent snapshot.
+   - The browser and Store remain active and operational to service subsequent discovery sessions without process restart.
+2. **Coordinated Shutdown Order**:
+   - Step 1: `handler.Deactivate()` halts all incoming responses across all contexts.
+   - Step 2: Active discovery session (if running) is flushed and finalized via `ctrl.StopDiscovery()`.
+   - Step 3: `mgr.Stop()` terminates Chromium and closes browser contexts.
+   - Step 4: `store.Close()`, `store.Wait()`, and `storeCancel()` drain any remaining store worker tasks.
+   - Telegram poller shutdown terminates cleanly with bounded timeout to avoid deadlocks.
 
 ---
 
@@ -181,7 +190,7 @@ In your private chat with the bot, send:
 ```
 /discovery_start
 ```
-The bot responds with the new session ID (e.g. `sess-20261116T012345Z`).
+The bot responds with the new collision-resistant session ID (e.g. `sess-20261116T012345Z-a1b2c3d4`).
 
 ### Step 4: Authenticate manually in the browser
 
@@ -237,12 +246,23 @@ Reports are written to `./data/discovery/reports/` with restrictive permissions 
 
 ### Report Contents
 
-1. **Summary**:
-   - Total observed responses, eligible JSON responses, unique endpoint fingerprints.
-   - Candidate counts by category (only strong candidates with confidence $\ge 0.6$).
-   - Total capture failures and queue overflows.
+1. **Summary & Unified Metrics**:
+   - `observed`: Total HTTP responses received by the handler.
+   - `filtered`: Responses rejected before queueing (inactive handler, non-bank domain, auth endpoints, non-JSON content, or auth secrets).
+   - `eligible`: Responses qualifying for capture (`observed = filtered + eligible`).
+   - `enqueued`: Responses successfully placed in the bounded capture store queue.
+   - `queue_overflow`: Eligible responses dropped because the capture queue was saturated (`eligible = enqueued + queue_overflow`).
+   - `processed`: Capture jobs dequeued and processed by the discovery Collector.
+   - `dropped`: Total jobs dropped (`dropped = queue_overflow + dropped_in_queue`).
+   - `capture_failed`: Processed responses that failed body retrieval or exceeded size limit (`capture_failed <= processed`).
+   - **Conservation Invariants**:
+     - $\text{Observed} = \text{Filtered} + \text{Eligible}$
+     - $\text{Eligible} = \text{Enqueued} + \text{QueueOverflow}$
+     - $\text{Dropped} = \text{QueueOverflow} + \text{DroppedInQueue}$
+     - $\text{Enqueued} = \text{Processed} + \text{DroppedInQueue}$
+     - $\text{Observed} = \text{Filtered} + \text{Processed} + \text{Dropped}$
 2. **Candidates by Category**:
-   - `transactions`: Operation history collections with monetary amounts, timestamps, identifiers, and optional MCC/merchant metadata.
+   - `transactions`: Operation history collections with monetary amounts, timestamps, identifiers, and optional MCC/merchant metadata evaluated strictly within the same repeated record scope.
    - `accounts`: Bank account lists and contract details.
    - `cards`: Plastic/virtual card lists, PAN metadata, payment systems.
    - `balances`: Standalone balance endpoints.
@@ -266,6 +286,7 @@ Reports are written to `./data/discovery/reports/` with restrictive permissions 
 
 ## 8. Privacy, Filtering, and Safety Mechanisms
 
+- **Structurally Scoped Classification**: Transaction evidence is strictly evaluated within the *same* repeated record structure (e.g. array items `$.items[]`). Fields from unrelated JSON branches (such as account metadata co-located with unrelated items) cannot falsely synthesize a transaction history classification. Generic commission and amount/status fields alone do not imply payment or transfer endpoints without domain signals.
 - **Content-Length Pre-Check**: Checks HTTP `Content-Length` header before reading body data. Payloads exceeding `MAX_RESPONSE_BODY_BYTES` are rejected prior to body allocation.
 - **Recursive Secret Detection**: Analyzes JSON structure for authentication secrets (`access_token`, `refresh_token`, `id_token`, `authorization`, `bearer`, `password`, `otp`, `one_time_password`, `client_secret`, `session_token`, `csrf_token`, `private_key`, etc.) across camelCase, snake_case, and kebab-case. Any response containing secrets is immediately discarded.
 - **Fail-Closed on Unparsable Data**: Bodies that cannot be parsed as valid JSON fail closed and are discarded.

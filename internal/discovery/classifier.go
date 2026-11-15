@@ -36,7 +36,7 @@ func (c *Classifier) Classify(fp *EndpointFingerprint) Classification {
 	normPath := strings.ToLower(fp.NormalizedPath)
 	pathSegments := strings.Split(normPath, "/")
 
-	// Extract schema facts once without duplicate counting.
+	// Extract schema facts with structural record scoping.
 	facts := analyzeSchemaFacts(fp)
 
 	// Evaluate candidate categories
@@ -61,7 +61,7 @@ func (c *Classifier) Classify(fp *EndpointFingerprint) Classification {
 	best := candidates[0]
 
 	// URL-only signal or insufficient independent evidence must return unknown.
-	if best.score < 0.35 || best.independentSignals < 2 {
+	if best.score < 0.40 || best.independentSignals < 2 {
 		return Classification{
 			Category:   CategoryUnknown,
 			Confidence: 0,
@@ -117,13 +117,22 @@ func categoryPriority(cat Category) int {
 	}
 }
 
+// recordScope tracks fields grouped within the same repeated structure (e.g. $.items[]).
+type recordScope struct {
+	prefix           string
+	hasID            bool
+	hasTimestamp     bool
+	hasAmount        bool
+	hasStatus        bool
+	hasMCC           bool
+	hasMerchant      bool
+	hasAccountFields bool
+	hasCardFields    bool
+	fieldCount       int
+}
+
 type schemaFacts struct {
-	hasID              bool
-	hasTimestamp       bool
-	hasAmount          bool
-	hasStatus          bool
-	hasMCC             bool
-	hasMerchant        bool
+	scopes             map[string]*recordScope
 	hasAccountFields   bool
 	hasCardFields      bool
 	hasBalanceFields   bool
@@ -131,50 +140,71 @@ type schemaFacts struct {
 	hasTransferFields  bool
 	hasStatementFields bool
 	hasCollection      bool
-	inArrayFields      int
+}
+
+// extractRecordScope extracts the array element prefix (e.g., "$[]" or "$.items[]")
+// from a field path, or "" if the field is not in a repeated record.
+func extractRecordScope(path string) string {
+	idx := strings.Index(path, "[]")
+	if idx >= 0 {
+		return path[:idx+2]
+	}
+	return ""
 }
 
 func analyzeSchemaFacts(fp *EndpointFingerprint) schemaFacts {
-	var facts schemaFacts
+	facts := schemaFacts{
+		scopes: make(map[string]*recordScope),
+	}
+
 	if fp.ReturnsList || fp.TopLevelKind == JSONKindArray {
 		facts.hasCollection = true
 	}
 
 	for _, f := range fp.SchemaFields {
 		leaf := strings.ToLower(extractLeafName(f.Path))
-		if f.InArray {
-			facts.inArrayFields++
+		prefix := extractRecordScope(f.Path)
+
+		scope, ok := facts.scopes[prefix]
+		if !ok {
+			scope = &recordScope{prefix: prefix}
+			facts.scopes[prefix] = scope
 		}
+		scope.fieldCount++
+
 		if f.Classification == FieldClassCollection {
 			facts.hasCollection = true
 		}
 
+		// Field classification per scope
 		switch f.Classification {
 		case FieldClassIdentifier:
-			facts.hasID = true
+			scope.hasID = true
 		case FieldClassTimestamp:
-			facts.hasTimestamp = true
+			scope.hasTimestamp = true
 		case FieldClassMonetary:
-			facts.hasAmount = true
+			scope.hasAmount = true
 		case FieldClassStatus:
-			facts.hasStatus = true
+			scope.hasStatus = true
 		case FieldClassMCC:
-			facts.hasMCC = true
+			scope.hasMCC = true
 		case FieldClassMerchant:
-			facts.hasMerchant = true
+			scope.hasMerchant = true
 		}
 
-		// Domain field detection
+		// Domain field detections
 		if containsAnyLeaf(leaf, "accountid", "accountnumber", "agreementnumber", "accounttype", "iban", "bban") {
 			facts.hasAccountFields = true
+			scope.hasAccountFields = true
 		}
 		if containsAnyLeaf(leaf, "cardid", "cardnumber", "pan", "paymentsystem", "cardstatus", "expirationdate") {
 			facts.hasCardFields = true
+			scope.hasCardFields = true
 		}
 		if containsAnyLeaf(leaf, "balance", "availablebalance", "currentbalance", "totalbalance") {
 			facts.hasBalanceFields = true
 		}
-		if containsAnyLeaf(leaf, "paymentid", "payee", "billid", "serviceid", "providerid", "receiptid", "commission") {
+		if containsAnyLeaf(leaf, "paymentid", "payee", "billid", "serviceid", "providerid", "receiptid", "paymenttype") {
 			facts.hasPaymentFields = true
 		}
 		if containsAnyLeaf(leaf, "transferid", "sourceaccount", "destinationaccount", "fromcard", "tocard", "recipientphone", "recipientbank", "sbpmemberid") {
@@ -190,32 +220,51 @@ func analyzeSchemaFacts(fp *EndpointFingerprint) schemaFacts {
 
 func (c *Classifier) evaluateTransactions(normPath string, segments []string, fp *EndpointFingerprint, f schemaFacts) categoryCandidate {
 	cand := categoryCandidate{category: CategoryTransactions}
+	pathHasTx := hasPathSegment(segments, "transactions", "transaction", "operations", "operation", "history")
 
 	// 1. Path evidence (weak on its own)
-	if hasPathSegment(segments, "transactions", "transaction", "operations", "operation", "history") {
+	if pathHasTx {
 		cand.score += 0.25
 		cand.independentSignals++
 		cand.reasons = append(cand.reasons, "path indicates a transaction history or operations endpoint")
 	}
 
-	// 2. Collection of transaction records (identifier + timestamp + monetary amount)
-	hasItemTriad := f.hasID && f.hasTimestamp && f.hasAmount && (f.hasCollection || f.inArrayFields >= 3)
-	if hasItemTriad {
+	// 2. Structurally scoped record evaluation:
+	// The triad (ID + Timestamp + Monetary Amount) must belong to the SAME repeated record structure (array item).
+	var matchingScope *recordScope
+	for prefix, scope := range f.scopes {
+		if prefix == "" {
+			continue // Non-array fields cannot constitute a repeated transaction collection
+		}
+
+		// Ensure it is not account or card metadata with balances and opening dates
+		if scope.hasAccountFields || scope.hasCardFields {
+			if !pathHasTx {
+				continue // Skip account/card objects unless path explicitly targets operations
+			}
+		}
+
+		if scope.hasID && scope.hasTimestamp && scope.hasAmount {
+			matchingScope = scope
+			break
+		}
+	}
+
+	if matchingScope != nil {
 		cand.score += 0.35
 		cand.independentSignals++
 		cand.hasDomainSchema = true
-		cand.reasons = append(cand.reasons, "schema defines a collection of records with identifier, timestamp, and monetary amount")
+		cand.reasons = append(cand.reasons, "response contains repeated record structure with identifier, timestamp, and monetary amount")
+
+		// Merchant and MCC must be associated with the same record structure
+		if matchingScope.hasMerchant || matchingScope.hasMCC {
+			cand.score += 0.20
+			cand.independentSignals++
+			cand.reasons = append(cand.reasons, "transaction record structure includes merchant or MCC categorization fields")
+		}
 	}
 
-	// 3. Merchant / MCC categorization
-	if f.hasMerchant || f.hasMCC {
-		cand.score += 0.20
-		cand.independentSignals++
-		cand.hasDomainSchema = true
-		cand.reasons = append(cand.reasons, "schema includes merchant or MCC categorization fields")
-	}
-
-	// 4. Behavioral signals (pagination, date range)
+	// 3. Behavioral signals (pagination, date range)
 	if fp.IsPaginated {
 		cand.score += 0.10
 		cand.reasons = append(cand.reasons, "endpoint indicates pagination support")
@@ -244,12 +293,6 @@ func (c *Classifier) evaluateStatements(normPath string, segments []string, fp *
 		cand.reasons = append(cand.reasons, "schema contains statement-specific boundary fields (period or balance totals)")
 	}
 
-	if f.hasAmount && f.hasTimestamp {
-		cand.score += 0.15
-		cand.independentSignals++
-		cand.reasons = append(cand.reasons, "schema contains monetary totals and date information")
-	}
-
 	return cand
 }
 
@@ -262,17 +305,13 @@ func (c *Classifier) evaluatePayments(normPath string, segments []string, fp *En
 		cand.reasons = append(cand.reasons, "path indicates a payment or billing endpoint")
 	}
 
+	// Generic commission, amount, or status alone must NOT imply payment.
+	// Dedicated payment domain fields (payee, billId, serviceId, paymentId) are strictly required.
 	if f.hasPaymentFields {
 		cand.score += 0.45
 		cand.independentSignals++
 		cand.hasDomainSchema = true
-		cand.reasons = append(cand.reasons, "schema contains payment-specific fields (e.g. payee, billId, or serviceId)")
-	}
-
-	if f.hasAmount && f.hasStatus {
-		cand.score += 0.15
-		cand.independentSignals++
-		cand.reasons = append(cand.reasons, "schema includes payment amount and execution status")
+		cand.reasons = append(cand.reasons, "schema contains payment domain fields (payee, billId, or serviceId)")
 	}
 
 	return cand
@@ -287,17 +326,13 @@ func (c *Classifier) evaluateTransfers(normPath string, segments []string, fp *E
 		cand.reasons = append(cand.reasons, "path indicates a money transfer or SBP endpoint")
 	}
 
+	// Generic amount or status alone must NOT imply transfer.
+	// Specific transfer routing fields (source/dest, SBP, recipient phone/bank) are strictly required.
 	if f.hasTransferFields {
 		cand.score += 0.45
 		cand.independentSignals++
 		cand.hasDomainSchema = true
 		cand.reasons = append(cand.reasons, "schema contains transfer routing fields (source/destination or SBP data)")
-	}
-
-	if f.hasAmount && (f.hasStatus || f.hasID) {
-		cand.score += 0.15
-		cand.independentSignals++
-		cand.reasons = append(cand.reasons, "schema includes transfer amount and status/identifier")
 	}
 
 	return cand
@@ -344,12 +379,6 @@ func (c *Classifier) evaluateCards(normPath string, segments []string, fp *Endpo
 		cand.reasons = append(cand.reasons, "schema contains card identifier or PAN/payment system fields")
 	}
 
-	if f.hasStatus {
-		cand.score += 0.10
-		cand.independentSignals++
-		cand.reasons = append(cand.reasons, "schema includes card status")
-	}
-
 	return cand
 }
 
@@ -367,13 +396,6 @@ func (c *Classifier) evaluateBalances(normPath string, segments []string, fp *En
 		cand.independentSignals++
 		cand.hasDomainSchema = true
 		cand.reasons = append(cand.reasons, "schema contains dedicated balance fields")
-	}
-
-	// Balances are typically not long lists of historical transaction items
-	if !f.hasMCC && !f.hasMerchant && f.hasAmount {
-		cand.score += 0.10
-		cand.independentSignals++
-		cand.reasons = append(cand.reasons, "schema is focused on monetary balances without merchant operations")
 	}
 
 	return cand

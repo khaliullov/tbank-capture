@@ -258,3 +258,98 @@ func TestStoreNoRawCapture(t *testing.T) {
 		t.Errorf("expected no raw files but found %d", len(entries))
 	}
 }
+
+// TestStore_FlushSession_DelayedProcessing verifies that FlushSession blocks until
+// all previously accepted jobs have been processed by the worker, even with delayed processing.
+func TestStore_FlushSession_DelayedProcessing(t *testing.T) {
+	col := newTestCollector(t)
+	sessionID := discovery.NewSessionID()
+	col.StartSession(sessionID)
+
+	store := capture.NewStore(noopLogger(), t.TempDir(), false, 128, col)
+	ctx := context.Background()
+
+	// Enqueue 20 jobs before worker starts
+	const initialJobs = 20
+	for i := 0; i < initialJobs; i++ {
+		if !store.Submit(sampleJob(sessionID, i)) {
+			t.Fatalf("failed to submit job %d", i)
+		}
+	}
+
+	go store.Run(ctx)
+
+	// Enqueue 10 more jobs concurrently
+	const concurrentJobs = 10
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < concurrentJobs; i++ {
+			time.Sleep(1 * time.Millisecond) // intentional delay
+			store.Submit(sampleJob(sessionID, initialJobs+i))
+		}
+	}()
+
+	wg.Wait()
+
+	// Now call FlushSession with a timeout context
+	flushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := store.FlushSession(flushCtx, sessionID); err != nil {
+		t.Fatalf("FlushSession failed: %v", err)
+	}
+
+	// At this exact point, all 30 jobs MUST be processed
+	m := col.Metrics()
+	expectedJobs := initialJobs + concurrentJobs
+	if m.Processed != expectedJobs {
+		t.Fatalf("expected %d processed jobs after flush, got %d", expectedJobs, m.Processed)
+	}
+
+	// Finalize session and verify report
+	sessCopy, fps, metrics, err := col.FinalizeSession(sessionID)
+	if err != nil {
+		t.Fatalf("FinalizeSession failed: %v", err)
+	}
+	if metrics.Processed != expectedJobs {
+		t.Fatalf("expected snapshot processed %d, got %d", expectedJobs, metrics.Processed)
+	}
+
+	gen := discovery.NewGenerator(t.TempDir())
+	_, _, err = gen.Generate(sessCopy, fps, metrics)
+	if err != nil {
+		t.Fatalf("Generate report failed: %v", err)
+	}
+
+	// Verify store and worker remain operational for a second discovery session
+	session2ID := discovery.NewSessionID()
+	col.StartSession(session2ID)
+
+	const session2Jobs = 5
+	for i := 0; i < session2Jobs; i++ {
+		if !store.Submit(sampleJob(session2ID, 100+i)) {
+			t.Fatalf("failed to submit job for session 2: %d", i)
+		}
+	}
+
+	// Stray old job with sessionID from previous session submitted now
+	store.Submit(sampleJob(sessionID, 999))
+
+	if err := store.FlushSession(flushCtx, session2ID); err != nil {
+		t.Fatalf("FlushSession for session 2 failed: %v", err)
+	}
+
+	m2 := col.Metrics()
+	if m2.Processed != session2Jobs {
+		t.Fatalf("expected %d processed jobs in session 2, got %d", session2Jobs, m2.Processed)
+	}
+	// Old job must have been dropped, not processed
+	if m2.Dropped != 1 {
+		t.Fatalf("expected stray old job to be dropped in session 2, got dropped=%d", m2.Dropped)
+	}
+
+	store.Close()
+	store.Wait()
+}

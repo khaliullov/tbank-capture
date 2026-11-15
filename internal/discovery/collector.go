@@ -27,12 +27,15 @@ type Collector struct {
 	fingerprints map[FingerprintID]*EndpointFingerprint
 	bodyHashes   map[FingerprintID]map[string]bool
 
-	// Metrics
-	totalObserved     int
-	eligibleResponses int
-	ignoredResponses  int
-	captureFailures   int
-	queueOverflows    int
+	// Unified metrics counters
+	observed      int
+	filtered      int
+	eligible      int
+	enqueued      int
+	processed     int
+	dropped       int
+	captureFailed int
+	queueOverflow int
 }
 
 // NewCollector creates a Collector. sessionDir is where session state JSON files are saved.
@@ -51,59 +54,142 @@ func NewCollector(log *slog.Logger, sessionDir string, cfg AnalyzerConfig) *Coll
 func (c *Collector) Metrics() Metrics {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.metricsLocked()
+}
+
+func (c *Collector) metricsLocked() Metrics {
 	m := Metrics{
-		TotalObserved:      c.totalObserved,
-		EligibleResponses:  c.eligibleResponses,
-		IgnoredResponses:   c.ignoredResponses,
-		CaptureFailures:    c.captureFailures,
-		QueueOverflows:     c.queueOverflows,
+		Observed:           c.observed,
+		Filtered:           c.filtered,
+		Eligible:           c.eligible,
+		Enqueued:           c.enqueued,
+		Processed:          c.processed,
+		Dropped:            c.dropped,
+		CaptureFailed:      c.captureFailed,
+		QueueOverflow:      c.queueOverflow,
 		UniqueFingerprints: len(c.fingerprints),
+
+		// Legacy aliases
+		TotalObserved:     c.observed,
+		EligibleResponses: c.eligible,
+		IgnoredResponses:  c.filtered,
+		CaptureFailures:   c.captureFailed,
+		QueueOverflows:    c.queueOverflow,
 	}
+
 	for _, fp := range c.fingerprints {
 		if fp.Classification.Category == CategoryTransactions && fp.Classification.Confidence >= 0.6 {
 			m.TransactionCandidates++
+		}
+		if fp.Classification.Category == CategoryAccounts && fp.Classification.Confidence >= 0.6 {
+			m.AccountCandidates++
+		}
+		if fp.Classification.Category == CategoryCards && fp.Classification.Confidence >= 0.6 {
+			m.CardCandidates++
+		}
+		if fp.Classification.Category == CategoryBalances && fp.Classification.Confidence >= 0.6 {
+			m.BalanceCandidates++
+		}
+		if fp.Classification.Category == CategoryPayments && fp.Classification.Confidence >= 0.6 {
+			m.PaymentCandidates++
+		}
+		if fp.Classification.Category == CategoryTransfers && fp.Classification.Confidence >= 0.6 {
+			m.TransferCandidates++
+		}
+		if fp.Classification.Category == CategoryStatements && fp.Classification.Confidence >= 0.6 {
+			m.StatementCandidates++
 		}
 	}
 	return m
 }
 
-// IncrQueueOverflow increments the queue overflow counter.
+// IncrObserved increments the total observed response counter.
+func (c *Collector) IncrObserved() {
+	c.mu.Lock()
+	c.observed++
+	c.mu.Unlock()
+}
+
+// IncrFiltered increments the filtered response counter.
+func (c *Collector) IncrFiltered() {
+	c.mu.Lock()
+	c.filtered++
+	c.mu.Unlock()
+}
+
+// IncrEligible increments the eligible response counter.
+func (c *Collector) IncrEligible() {
+	c.mu.Lock()
+	c.eligible++
+	c.mu.Unlock()
+}
+
+// IncrEnqueued increments the enqueued job counter.
+func (c *Collector) IncrEnqueued() {
+	c.mu.Lock()
+	c.enqueued++
+	c.mu.Unlock()
+}
+
+// IncrQueueOverflow increments both queue overflow and dropped counters.
 func (c *Collector) IncrQueueOverflow() {
 	c.mu.Lock()
-	c.queueOverflows++
+	c.queueOverflow++
+	c.dropped++
 	c.mu.Unlock()
 }
 
-// IncrIgnored increments the ignored counter and total observed counter.
+// IncrDroppedInQueue increments dropped count for jobs drained during cancellation.
+func (c *Collector) IncrDroppedInQueue() {
+	c.mu.Lock()
+	c.dropped++
+	c.mu.Unlock()
+}
+
+// IncrCaptureFailed increments the capture failure counter.
+func (c *Collector) IncrCaptureFailed() {
+	c.mu.Lock()
+	c.captureFailed++
+	c.mu.Unlock()
+}
+
+// IncrIgnored is a backward-compatible alias that increments both filtered and observed.
 func (c *Collector) IncrIgnored() {
 	c.mu.Lock()
-	c.ignoredResponses++
-	c.totalObserved++
+	c.filtered++
+	c.observed++
 	c.mu.Unlock()
 }
 
-// StartSession begins a new discovery session. Any previous session is stopped.
+// StartSession begins a new discovery session. Any previous active session is finalized.
 func (c *Collector) StartSession(id SessionID) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if c.session != nil && c.session.Active {
+	if c.session != nil && (c.session.State == SessionStateActive || c.session.State == SessionStateStopping) {
 		c.session.Active = false
+		c.session.State = SessionStateStopped
 		c.session.StoppedAt = time.Now().UTC()
 	}
 
 	c.session = &Session{
 		ID:        id,
 		StartedAt: time.Now().UTC(),
+		State:     SessionStateActive,
 		Active:    true,
 	}
 	c.fingerprints = make(map[FingerprintID]*EndpointFingerprint)
 	c.bodyHashes = make(map[FingerprintID]map[string]bool)
-	c.totalObserved = 0
-	c.eligibleResponses = 0
-	c.ignoredResponses = 0
-	c.captureFailures = 0
-	c.queueOverflows = 0
+
+	c.observed = 0
+	c.filtered = 0
+	c.eligible = 0
+	c.enqueued = 0
+	c.processed = 0
+	c.dropped = 0
+	c.captureFailed = 0
+	c.queueOverflow = 0
+
 	c.log.Info("discovery session started", "sessionID", id)
 }
 
@@ -118,23 +204,95 @@ func (c *Collector) ActiveSession() *Session {
 	return &cp
 }
 
-// ProcessJob validates the job against the active session and updates endpoint fingerprints.
+// BeginStopping transitions the session to SessionStateStopping, preventing new events
+// while allowing existing queued jobs for this session to be processed.
+func (c *Collector) BeginStopping(id SessionID) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.session == nil || c.session.ID != id {
+		return fmt.Errorf("session %s not found", id)
+	}
+	if c.session.State != SessionStateActive {
+		return fmt.Errorf("session %s is not active (state: %s)", id, c.session.State)
+	}
+
+	c.session.State = SessionStateStopping
+	c.log.Info("discovery session stopping (draining queued jobs)", "sessionID", id)
+	return nil
+}
+
+// FinalizeSession transitions the session to SessionStateStopped and returns consistent
+// snapshots of session state, fingerprints, and metrics.
+func (c *Collector) FinalizeSession(id SessionID) (*Session, []*EndpointFingerprint, Metrics, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.session == nil || c.session.ID != id {
+		return nil, nil, Metrics{}, fmt.Errorf("session %s not found", id)
+	}
+	if c.session.State == SessionStateStopped {
+		return nil, nil, Metrics{}, fmt.Errorf("session %s already stopped", id)
+	}
+
+	c.session.State = SessionStateStopped
+	c.session.Active = false
+	c.session.StoppedAt = time.Now().UTC()
+
+	sessCopy := *c.session
+	fps := make([]*EndpointFingerprint, 0, len(c.fingerprints))
+	for _, fp := range c.fingerprints {
+		fps = append(fps, cloneFingerprint(fp))
+	}
+	sort.Slice(fps, func(i, j int) bool {
+		if fps[i].Classification.Confidence != fps[j].Classification.Confidence {
+			return fps[i].Classification.Confidence > fps[j].Classification.Confidence
+		}
+		return fps[i].NormalizedPath < fps[j].NormalizedPath
+	})
+
+	metrics := c.metricsLocked()
+	c.log.Info("discovery session finalized", "sessionID", id, "fingerprints", len(fps), "processed", metrics.Processed)
+
+	return &sessCopy, fps, metrics, nil
+}
+
+// StopSession marks the active session as stopped immediately and returns a snapshot copy.
+func (c *Collector) StopSession() *Session {
+	c.mu.Lock()
+	if c.session == nil {
+		c.mu.Unlock()
+		return nil
+	}
+	id := c.session.ID
+	c.mu.Unlock()
+
+	_ = c.BeginStopping(id)
+	sess, _, _, _ := c.FinalizeSession(id)
+	return sess
+}
+
+// ProcessJob validates the job against the active or stopping session and updates endpoint fingerprints.
 // Jobs from inactive or mismatched sessions are rejected to ensure strict session isolation.
 func (c *Collector) ProcessJob(job CaptureJob) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Strict session validation: job must match the active session.
-	if c.session == nil || !c.session.Active || job.SessionID == "" || job.SessionID != c.session.ID {
-		c.ignoredResponses++
+	// Strict session validation: job must match the active or stopping session.
+	if c.session == nil || (c.session.State != SessionStateActive && c.session.State != SessionStateStopping) || job.SessionID == "" || job.SessionID != c.session.ID {
+		if c.session != nil && (c.session.State == SessionStateActive || c.session.State == SessionStateStopping) {
+			c.dropped++
+		} else {
+			c.filtered++
+		}
 		return
 	}
 
-	c.totalObserved++
+	c.processed++
 
 	var warnings []string
 	if job.BodyError != "" {
-		c.captureFailures++
+		c.captureFailed++
 		warningMsg := fmt.Sprintf("body retrieval failed: %s", job.BodyError)
 		warnings = append(warnings, warningMsg)
 		c.log.Debug("body retrieval issue", "url", sanitizeURLForLog(job.URL), "err", job.BodyError)
@@ -147,7 +305,7 @@ func (c *Collector) ProcessJob(job CaptureJob) {
 		var err error
 		fields, topKind, err = AnalyzeJSON(job.Body, c.analyzerCfg)
 		if err != nil {
-			c.captureFailures++
+			c.captureFailed++
 			warningMsg := fmt.Sprintf("json analysis error: %s", err)
 			warnings = append(warnings, warningMsg)
 			c.log.Debug("json analysis issue", "err", err)
@@ -216,23 +374,6 @@ func (c *Collector) ProcessJob(job CaptureJob) {
 
 	// Recompute classification with latest evidence.
 	fp.Classification = c.classifier.Classify(fp)
-
-	c.eligibleResponses++
-}
-
-// StopSession marks the active session as stopped and returns a snapshot copy.
-func (c *Collector) StopSession() *Session {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.session != nil && c.session.Active {
-		c.session.StoppedAt = time.Now().UTC()
-		c.session.Active = false
-	}
-	if c.session == nil {
-		return nil
-	}
-	cp := *c.session
-	return &cp
 }
 
 // Fingerprints returns a deep-copy snapshot of all collected fingerprints.

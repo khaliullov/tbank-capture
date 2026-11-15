@@ -293,3 +293,81 @@ func TestClassifier_FailedBodyRetrievalLowConfidence(t *testing.T) {
 		t.Errorf("missing body endpoint should be unknown, got %s", cl.Category)
 	}
 }
+
+// TestClassifier_MixedBranchesNotTransactions verifies that fields from unrelated branches
+// (e.g. account.id and items[].amount) do NOT combine into a false transaction signature.
+func TestClassifier_MixedBranchesNotTransactions(t *testing.T) {
+	c := discovery.NewClassifier()
+	fields := []discovery.FieldSchema{
+		{Path: "$.account.id", ObservedTypes: []string{"string"}, Classification: discovery.FieldClassIdentifier},
+		{Path: "$.account.updatedAt", ObservedTypes: []string{"string"}, Classification: discovery.FieldClassTimestamp},
+		{Path: "$.items", ObservedTypes: []string{"array"}, Classification: discovery.FieldClassCollection},
+		{Path: "$.items[].amount", ObservedTypes: []string{"number"}, Classification: discovery.FieldClassMonetary, InArray: true},
+	}
+	fp := makeFingerprint("GET", "/api/v1/user/summary", "xhr",
+		discovery.JSONKindObject, fields, true, false)
+
+	cl := c.Classify(fp)
+	if cl.Category == discovery.CategoryTransactions {
+		t.Errorf("unrelated branches erroneously classified as transactions!")
+	}
+	if cl.Category != discovery.CategoryUnknown {
+		t.Errorf("expected unknown for mixed unrelated branches, got %s", cl.Category)
+	}
+}
+
+// TestClassifier_GenericCommissionNotPayment verifies that a generic commission field
+// without payment domain fields (payee, billId, serviceId) does NOT imply a payment endpoint.
+func TestClassifier_GenericCommissionNotPayment(t *testing.T) {
+	c := discovery.NewClassifier()
+	fields := []discovery.FieldSchema{
+		{Path: "$.tariffId", ObservedTypes: []string{"string"}, Classification: discovery.FieldClassIdentifier},
+		{Path: "$.commission", ObservedTypes: []string{"number"}, Classification: discovery.FieldClassMonetary},
+		{Path: "$.currency", ObservedTypes: []string{"string"}},
+	}
+	fp := makeFingerprint("GET", "/api/v1/tariffs/info", "xhr",
+		discovery.JSONKindObject, fields, false, false)
+
+	cl := c.Classify(fp)
+	if cl.Category == discovery.CategoryPayments {
+		t.Errorf("generic commission field erroneously classified as payments!")
+	}
+}
+
+// TestClassifier_GenericAmountStatusNotTransfer verifies that generic amount and status fields
+// without transfer routing fields (source/dest, SBP, recipient) do NOT imply a transfer endpoint.
+func TestClassifier_GenericAmountStatusNotTransfer(t *testing.T) {
+	c := discovery.NewClassifier()
+	fields := []discovery.FieldSchema{
+		{Path: "$.limitId", ObservedTypes: []string{"string"}, Classification: discovery.FieldClassIdentifier},
+		{Path: "$.amount", ObservedTypes: []string{"number"}, Classification: discovery.FieldClassMonetary},
+		{Path: "$.status", ObservedTypes: []string{"string"}, Classification: discovery.FieldClassStatus},
+	}
+	fp := makeFingerprint("GET", "/api/v1/client/limits", "xhr",
+		discovery.JSONKindObject, fields, false, false)
+
+	cl := c.Classify(fp)
+	if cl.Category == discovery.CategoryTransfers {
+		t.Errorf("generic amount and status erroneously classified as transfers!")
+	}
+}
+
+// TestClassifier_AccountListNotTransactions verifies that an account collection containing
+// balances and timestamps remains classified as Accounts, not Transactions.
+func TestClassifier_AccountListNotTransactions(t *testing.T) {
+	c := discovery.NewClassifier()
+	fields := []discovery.FieldSchema{
+		{Path: "$.accounts", ObservedTypes: []string{"array"}, Classification: discovery.FieldClassCollection},
+		{Path: "$.accounts[].accountId", ObservedTypes: []string{"string"}, Classification: discovery.FieldClassIdentifier, InArray: true},
+		{Path: "$.accounts[].accountNumber", ObservedTypes: []string{"string"}, InArray: true},
+		{Path: "$.accounts[].balance", ObservedTypes: []string{"number"}, Classification: discovery.FieldClassMonetary, InArray: true},
+		{Path: "$.accounts[].openedAt", ObservedTypes: []string{"string"}, Classification: discovery.FieldClassTimestamp, InArray: true},
+	}
+	fp := makeFingerprint("GET", "/api/v1/accounts", "xhr",
+		discovery.JSONKindObject, fields, true, false)
+
+	cl := c.Classify(fp)
+	if cl.Category != discovery.CategoryAccounts {
+		t.Errorf("expected accounts, got %s (conf: %.2f)", cl.Category, cl.Confidence)
+	}
+}
