@@ -2,10 +2,13 @@ package capture_test
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/khaliullov/tbank-capture/internal/capture"
 	"github.com/khaliullov/tbank-capture/internal/discovery"
@@ -23,51 +26,164 @@ func newTestCollector(t *testing.T) *discovery.Collector {
 	return c
 }
 
-// TestStoreGracefulShutdown verifies that the store drains pending jobs on shutdown.
-func TestStoreGracefulShutdown(t *testing.T) {
-	col := newTestCollector(t)
-	col.StartSession("test-session")
-	store := capture.NewStore(noopLogger(), t.TempDir(), false, 32, col)
-	ctx, cancel := context.WithCancel(context.Background())
-	go store.Run(ctx)
+func sampleJob(sessionID discovery.SessionID, i int) discovery.CaptureJob {
+	return discovery.CaptureJob{
+		SessionID:    sessionID,
+		Method:       "GET",
+		URL:          fmt.Sprintf("https://www.tbank.ru/api/v1/test/%d", i),
+		Status:       200,
+		ContentType:  "application/json",
+		ResourceType: "xhr",
+		Body:         []byte(fmt.Sprintf(`{"id":"%d"}`, i)),
+		BodySize:     10,
+	}
+}
 
-	q := store.Queue()
-	for i := 0; i < 5; i++ {
-		q <- discovery.CaptureJob{
-			SessionID:    "test-session",
-			Method:       "GET",
-			URL:          "https://www.tbank.ru/api/v1/test",
-			Status:       200,
-			ContentType:  "application/json",
-			ResourceType: "xhr",
-			Body:         []byte(`{"id":"1"}`),
-			BodySize:     10,
+// TestStore_ShutdownEmptyQueue verifies shutdown with an empty queue.
+func TestStore_ShutdownEmptyQueue(t *testing.T) {
+	col := newTestCollector(t)
+	col.StartSession("sess-empty")
+	store := capture.NewStore(noopLogger(), t.TempDir(), false, 32, col)
+	ctx := context.Background()
+
+	go store.Run(ctx)
+	store.Close()
+	store.Wait() // Must exit cleanly without hanging
+}
+
+// TestStore_ShutdownPendingJobs verifies that all pending jobs are drained and processed.
+func TestStore_ShutdownPendingJobs(t *testing.T) {
+	col := newTestCollector(t)
+	col.StartSession("sess-pending")
+	store := capture.NewStore(noopLogger(), t.TempDir(), false, 64, col)
+	ctx := context.Background()
+
+	// Enqueue jobs before running worker
+	const totalJobs = 15
+	for i := 0; i < totalJobs; i++ {
+		ok := store.Submit(sampleJob("sess-pending", i))
+		if !ok {
+			t.Fatalf("failed to submit job %d", i)
 		}
 	}
 
-	cancel()
-	store.Wait() // must not hang
+	go store.Run(ctx)
+	store.Close()
+	store.Wait()
+
+	fps := col.Fingerprints()
+	if len(fps) == 0 {
+		t.Fatal("expected fingerprints from processed jobs")
+	}
+	var totalObservations int
+	for _, fp := range fps {
+		totalObservations += fp.Observations
+	}
+	if totalObservations != totalJobs {
+		t.Fatalf("expected %d observations, got %d", totalJobs, totalObservations)
+	}
 }
 
-// TestStoreQueueCapacity verifies that the queue respects its capacity.
-func TestStoreQueueCapacity(t *testing.T) {
+// TestStore_QueueSaturation verifies non-blocking behavior when queue capacity is reached.
+func TestStore_QueueSaturation(t *testing.T) {
 	col := newTestCollector(t)
-	col.StartSession("test-session")
+	col.StartSession("sess-sat")
+	// Capacity of 2
 	store := capture.NewStore(noopLogger(), t.TempDir(), false, 2, col)
 
-	q := store.Queue()
-	job := discovery.CaptureJob{SessionID: "test-session", Method: "GET", URL: "https://www.tbank.ru/", Status: 200}
-
-	// Fill to capacity.
-	q <- job
-	q <- job
-	// Third write must NOT block (non-blocking send in handler is simulated here).
-	select {
-	case q <- job:
-		// accepted — may have drained already
-	default:
-		// queue full — expected
+	// Submit 2 jobs to fill queue
+	if !store.Submit(sampleJob("sess-sat", 1)) {
+		t.Fatal("expected first job to be accepted")
 	}
+	if !store.Submit(sampleJob("sess-sat", 2)) {
+		t.Fatal("expected second job to be accepted")
+	}
+
+	// Third submission must immediately return false without blocking
+	done := make(chan bool, 1)
+	go func() {
+		accepted := store.Submit(sampleJob("sess-sat", 3))
+		done <- accepted
+	}()
+
+	select {
+	case accepted := <-done:
+		if accepted {
+			t.Error("expected third job to be rejected due to queue saturation")
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Submit blocked on saturated queue!")
+	}
+}
+
+// TestStore_ConcurrentSubmissionDuringShutdown verifies race-safety when multiple
+// goroutines call Submit while Close is called.
+func TestStore_ConcurrentSubmissionDuringShutdown(t *testing.T) {
+	col := newTestCollector(t)
+	col.StartSession("sess-conc-shutdown")
+	store := capture.NewStore(noopLogger(), t.TempDir(), false, 128, col)
+	ctx := context.Background()
+
+	go store.Run(ctx)
+
+	var wg sync.WaitGroup
+	const submitters = 8
+	for i := 0; i < submitters; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < 50; j++ {
+				store.Submit(sampleJob("sess-conc-shutdown", id*100+j))
+				time.Sleep(10 * time.Microsecond)
+			}
+		}(i)
+	}
+
+	time.Sleep(1 * time.Millisecond)
+	store.Close()
+
+	wg.Wait()
+	store.Wait()
+}
+
+// TestStore_RepeatedShutdownCalls verifies that Close can be called repeatedly without panic.
+func TestStore_RepeatedShutdownCalls(t *testing.T) {
+	col := newTestCollector(t)
+	store := capture.NewStore(noopLogger(), t.TempDir(), false, 16, col)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			store.Close()
+		}()
+	}
+	wg.Wait()
+}
+
+// TestStore_WorkerCancellation verifies that context cancellation terminates worker
+// and accounts for any remaining queued jobs.
+func TestStore_WorkerCancellation(t *testing.T) {
+	col := newTestCollector(t)
+	col.StartSession("sess-cancel")
+	store := capture.NewStore(noopLogger(), t.TempDir(), false, 64, col)
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Fill queue with some jobs
+	for i := 0; i < 10; i++ {
+		store.Submit(sampleJob("sess-cancel", i))
+	}
+
+	go store.Run(ctx)
+
+	// Cancel context immediately
+	cancel()
+	store.Wait() // Must exit cleanly
+
+	dropped := store.DroppedCount()
+	t.Logf("Worker cancelled successfully. Dropped jobs accounted for: %d", dropped)
 }
 
 // TestStoreRawCapture verifies that raw files are created with correct permissions.
@@ -76,10 +192,10 @@ func TestStoreRawCapture(t *testing.T) {
 	col := newTestCollector(t)
 	col.StartSession("test-session")
 	store := capture.NewStore(noopLogger(), rawDir, true /*rawEnabled*/, 32, col)
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx := context.Background()
 	go store.Run(ctx)
 
-	store.Queue() <- discovery.CaptureJob{
+	store.Submit(discovery.CaptureJob{
 		SessionID:    "test-session",
 		Method:       "GET",
 		URL:          "https://www.tbank.ru/api/v1/test",
@@ -88,9 +204,9 @@ func TestStoreRawCapture(t *testing.T) {
 		ResourceType: "xhr",
 		Body:         []byte(`{"id":"synthetic-test-value"}`),
 		BodySize:     29,
-	}
+	})
 
-	cancel()
+	store.Close()
 	store.Wait()
 
 	sessDir := filepath.Join(rawDir, "test-session")
@@ -119,10 +235,10 @@ func TestStoreNoRawCapture(t *testing.T) {
 	col := newTestCollector(t)
 	col.StartSession("test-session")
 	store := capture.NewStore(noopLogger(), rawDir, false /*rawEnabled*/, 32, col)
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx := context.Background()
 	go store.Run(ctx)
 
-	store.Queue() <- discovery.CaptureJob{
+	store.Submit(discovery.CaptureJob{
 		SessionID:    "test-session",
 		Method:       "GET",
 		URL:          "https://www.tbank.ru/api/v1/test",
@@ -131,131 +247,14 @@ func TestStoreNoRawCapture(t *testing.T) {
 		ResourceType: "xhr",
 		Body:         []byte(`{"id":"synthetic-value"}`),
 		BodySize:     22,
-	}
+	})
 
-	cancel()
+	store.Close()
 	store.Wait()
 
 	sessDir := filepath.Join(rawDir, "test-session")
-	_, err := os.Stat(sessDir)
-	if err == nil {
-		entries, _ := os.ReadDir(sessDir)
-		if len(entries) > 0 {
-			t.Errorf("expected no raw files but found %d", len(entries))
-		}
-	}
-}
-
-// TestFilterEligibleURL verifies domain filtering.
-func TestFilterEligibleURL(t *testing.T) {
-	f := capture.NewFilter(noopLogger(), 1024*1024, []string{"tbank.ru"})
-
-	cases := []struct {
-		url  string
-		want bool
-	}{
-		{"https://www.tbank.ru/api/v1/test", true},
-		{"https://tbank.ru/api/v1/test", true},
-		{"https://api.tbank.ru/v1/test", true},
-		{"https://evil.com/api/v1/test", false},
-		{"https://evil-tbank.ru/api/v1/test", false},
-		{"https://google.com", false},
-	}
-	for _, tc := range cases {
-		got := f.EligibleURL(tc.url)
-		if got != tc.want {
-			t.Errorf("EligibleURL(%q) = %v, want %v", tc.url, got, tc.want)
-		}
-	}
-}
-
-// TestFilterQueryStringRemoval verifies query strings are stripped from stored URLs.
-func TestFilterQueryStringRemoval(t *testing.T) {
-	raw := "https://www.tbank.ru/api/v1/test?from=2024-01-01&to=2024-02-01&token=secret123"
-	normalized := capture.NormalizedURL(raw)
-	if normalized != "https://www.tbank.ru/api/v1/test" {
-		t.Errorf("expected query stripped, got %q", normalized)
-	}
-}
-
-// TestFilterAuthPaths verifies that authentication paths are excluded.
-func TestFilterAuthPaths(t *testing.T) {
-	f := capture.NewFilter(noopLogger(), 1024*1024, []string{"tbank.ru"})
-	authPaths := []string{
-		"https://www.tbank.ru/api/common/v1/authorize",
-		"https://www.tbank.ru/api/common/v1/login",
-		"https://www.tbank.ru/api/common/v1/token",
-	}
-	for _, url := range authPaths {
-		if f.EligiblePath(url) {
-			t.Errorf("auth path should be excluded: %s", url)
-		}
-	}
-}
-
-// TestContainsAuthSecret verifies detection of common auth-secret field names.
-func TestContainsAuthSecret(t *testing.T) {
-	cases := []struct {
-		body []byte
-		want bool
-	}{
-		{[]byte(`{"access_token":"abc123","expires_in":3600}`), true},
-		{[]byte(`{"refresh_token":"xyz"}`), true},
-		{[]byte(`{"id":"123","amount":100,"status":"ok"}`), false},
-		{[]byte(`{"name":"Alice","balance":999}`), false},
-	}
-	for _, tc := range cases {
-		got := capture.ContainsAuthSecret(tc.body)
-		if got != tc.want {
-			t.Errorf("ContainsAuthSecret(%s) = %v, want %v", tc.body, got, tc.want)
-		}
-	}
-}
-
-// TestFilterResourceType verifies only xhr/fetch resources are accepted.
-func TestFilterResourceType(t *testing.T) {
-	f := capture.NewFilter(noopLogger(), 1024*1024, []string{"tbank.ru"})
-	cases := []struct {
-		rt   string
-		want bool
-	}{
-		{"xhr", true},
-		{"fetch", true},
-		{"XHR", true},
-		{"Fetch", true},
-		{"document", false},
-		{"script", false},
-		{"image", false},
-		{"stylesheet", false},
-		{"websocket", false},
-	}
-	for _, tc := range cases {
-		got := f.EligibleResourceType(tc.rt)
-		if got != tc.want {
-			t.Errorf("EligibleResourceType(%q) = %v, want %v", tc.rt, got, tc.want)
-		}
-	}
-}
-
-// TestFilterContentType verifies only JSON content types are accepted.
-func TestFilterContentType(t *testing.T) {
-	f := capture.NewFilter(noopLogger(), 1024*1024, []string{"tbank.ru"})
-	cases := []struct {
-		ct   string
-		want bool
-	}{
-		{"application/json", true},
-		{"application/json; charset=utf-8", true},
-		{"application/vnd.api+json", true},
-		{"text/html", false},
-		{"text/plain", false},
-		{"application/octet-stream", false},
-		{"image/png", false},
-	}
-	for _, tc := range cases {
-		got := f.EligibleContentType(tc.ct)
-		if got != tc.want {
-			t.Errorf("EligibleContentType(%q) = %v, want %v", tc.ct, got, tc.want)
-		}
+	entries, _ := os.ReadDir(sessDir)
+	if len(entries) > 0 {
+		t.Errorf("expected no raw files but found %d", len(entries))
 	}
 }

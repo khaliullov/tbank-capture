@@ -21,6 +21,9 @@ func TestNormalizePath(t *testing.T) {
 		{"/", "/"},
 		{"", "/"},
 		{"/api/v2/payments/9876543210/status", "/api/v2/payments/{id}/status"},
+		{"/api/v1/accounts/acc_12345678/details", "/api/v1/accounts/{id}/details"},
+		{"/api/v1/cards/card-abcdef1234/balance", "/api/v1/cards/{id}/balance"},
+		{"/api/v1/operations/op_9876543210/receipt", "/api/v1/operations/{id}/receipt"},
 	}
 	for _, tc := range cases {
 		got := discovery.NormalizePath(tc.input)
@@ -53,17 +56,21 @@ func TestBuildFingerprintIDDistinct(t *testing.T) {
 	}
 }
 
-// TestQueryHasDateParams verifies date param detection without storing values.
+// TestQueryHasDateParams verifies case and delimiter insensitive date param detection.
 func TestQueryHasDateParams(t *testing.T) {
 	cases := []struct {
 		query string
 		want  bool
 	}{
 		{"from=2024-01-01&to=2024-02-01", true},
+		{"FROM=2024-01-01&TO=2024-02-01", true},
+		{"from_date=2024-01-01&to_date=2024-02-01", true},
+		{"START-DATE=2024-01-01", true},
 		{"limit=20&offset=0", false},
 		{"startDate=2024-01-01", true},
 		{"", false},
 		{"page=2&dateFrom=2024-01-01", true},
+		{"period=monthly", true},
 	}
 	for _, tc := range cases {
 		got := discovery.QueryHasDateParams(tc.query)

@@ -224,6 +224,86 @@ func TestKeyOrderIndependence(t *testing.T) {
 	}
 }
 
+// TestAnalyzeJSON_UnusualPropertyNames verifies that keys containing dots, brackets, quotes are handled properly.
+func TestAnalyzeJSON_UnusualPropertyNames(t *testing.T) {
+	data := []byte(`{
+		"user.name": "Alice",
+		"foo[bar]": 123,
+		"quote\"key": true,
+		"normal_key": "ok"
+	}`)
+
+	fields, _, err := discovery.AnalyzeJSON(data, cfg())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	assertFieldPresent(t, fields, `$["user.name"]`)
+	assertFieldPresent(t, fields, `$["foo[bar]"]`)
+	assertFieldPresent(t, fields, `$["quote\"key"]`)
+	assertFieldPresent(t, fields, `$.normal_key`)
+}
+
+// TestAnalyzeJSON_PathologicalNesting verifies that very deep nesting is bounded by MaxDepth.
+func TestAnalyzeJSON_PathologicalNesting(t *testing.T) {
+	var current interface{} = "leaf"
+	for i := 0; i < 200; i++ {
+		current = map[string]interface{}{"level": current}
+	}
+	data, err := json.Marshal(current)
+	if err != nil {
+		t.Fatalf("marshal error: %v", err)
+	}
+
+	limited := discovery.AnalyzerConfig{MaxDepth: 10, MaxArrayElems: 5, MaxFields: 1000}
+	fields, _, err := discovery.AnalyzeJSON(data, limited)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(fields) > limited.MaxDepth+2 {
+		t.Errorf("expected at most %d fields, got %d", limited.MaxDepth+2, len(fields))
+	}
+}
+
+// TestAnalyzeJSON_MixedArrayTypes verifies multiple types inside an array.
+func TestAnalyzeJSON_MixedArrayTypes(t *testing.T) {
+	data := []byte(`{"values": [1, "two", true, null, {"id": 123}]}`)
+	fields, _, err := discovery.AnalyzeJSON(data, cfg())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	assertFieldPresent(t, fields, "$.values")
+	assertFieldPresent(t, fields, "$.values[]")
+	assertTypePresent(t, fields, "$.values[]", "number")
+	assertTypePresent(t, fields, "$.values[]", "string")
+	assertTypePresent(t, fields, "$.values[]", "bool")
+	assertTypePresent(t, fields, "$.values[]", "null")
+	assertTypePresent(t, fields, "$.values[]", "object")
+	assertFieldPresent(t, fields, "$.values[].id")
+}
+
+// TestAnalyzeJSON_LargeObjectPerformance verifies that analyzing an object with 2000 fields is fast.
+func TestAnalyzeJSON_LargeObjectPerformance(t *testing.T) {
+	obj := make(map[string]interface{}, 2000)
+	for i := 0; i < 2000; i++ {
+		obj[fmt.Sprintf("key_%04d", i)] = i
+	}
+	data, err := json.Marshal(obj)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fields, _, err := discovery.AnalyzeJSON(data, cfg())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(fields) != 2000 {
+		t.Errorf("expected 2000 fields, got %d", len(fields))
+	}
+}
+
 // --- helpers ---
 
 func assertFieldPresent(t *testing.T, fields []discovery.FieldSchema, path string) {

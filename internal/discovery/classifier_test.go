@@ -170,3 +170,126 @@ func TestClassifier_ReasonsPresent(t *testing.T) {
 		t.Error("classifier must always provide reasons")
 	}
 }
+
+// TestClassifier_PaymentCandidate tests payment endpoint classification.
+func TestClassifier_PaymentCandidate(t *testing.T) {
+	c := discovery.NewClassifier()
+	fields := []discovery.FieldSchema{
+		{Path: "$.paymentId", ObservedTypes: []string{"string"}, Classification: discovery.FieldClassIdentifier},
+		{Path: "$.payee", ObservedTypes: []string{"string"}, Classification: discovery.FieldClassMerchant},
+		{Path: "$.amount", ObservedTypes: []string{"number"}, Classification: discovery.FieldClassMonetary},
+		{Path: "$.commission", ObservedTypes: []string{"number"}, Classification: discovery.FieldClassMonetary},
+		{Path: "$.status", ObservedTypes: []string{"string"}, Classification: discovery.FieldClassStatus},
+	}
+	fp := makeFingerprint("POST", "/api/v1/payments/execute", "fetch",
+		discovery.JSONKindObject, fields, false, false)
+
+	cl := c.Classify(fp)
+	if cl.Category != discovery.CategoryPayments {
+		t.Errorf("expected payments, got %s (conf: %.2f)", cl.Category, cl.Confidence)
+	}
+	if cl.Confidence < 0.6 {
+		t.Errorf("expected confidence >= 0.6, got %.2f", cl.Confidence)
+	}
+}
+
+// TestClassifier_TransferCandidate tests transfer endpoint classification.
+func TestClassifier_TransferCandidate(t *testing.T) {
+	c := discovery.NewClassifier()
+	fields := []discovery.FieldSchema{
+		{Path: "$.transferId", ObservedTypes: []string{"string"}, Classification: discovery.FieldClassIdentifier},
+		{Path: "$.sourceAccount", ObservedTypes: []string{"string"}},
+		{Path: "$.destinationAccount", ObservedTypes: []string{"string"}},
+		{Path: "$.amount", ObservedTypes: []string{"number"}, Classification: discovery.FieldClassMonetary},
+		{Path: "$.recipientPhone", ObservedTypes: []string{"string"}},
+		{Path: "$.status", ObservedTypes: []string{"string"}, Classification: discovery.FieldClassStatus},
+	}
+	fp := makeFingerprint("POST", "/api/v1/transfers/sbp", "fetch",
+		discovery.JSONKindObject, fields, false, false)
+
+	cl := c.Classify(fp)
+	if cl.Category != discovery.CategoryTransfers {
+		t.Errorf("expected transfers, got %s (conf: %.2f)", cl.Category, cl.Confidence)
+	}
+	if cl.Confidence < 0.6 {
+		t.Errorf("expected confidence >= 0.6, got %.2f", cl.Confidence)
+	}
+}
+
+// TestClassifier_StatementCandidate tests statement endpoint classification.
+func TestClassifier_StatementCandidate(t *testing.T) {
+	c := discovery.NewClassifier()
+	fields := []discovery.FieldSchema{
+		{Path: "$.statementId", ObservedTypes: []string{"string"}, Classification: discovery.FieldClassIdentifier},
+		{Path: "$.periodStart", ObservedTypes: []string{"string"}, Classification: discovery.FieldClassTimestamp},
+		{Path: "$.periodEnd", ObservedTypes: []string{"string"}, Classification: discovery.FieldClassTimestamp},
+		{Path: "$.openingBalance", ObservedTypes: []string{"number"}, Classification: discovery.FieldClassMonetary},
+		{Path: "$.closingBalance", ObservedTypes: []string{"number"}, Classification: discovery.FieldClassMonetary},
+		{Path: "$.turnover", ObservedTypes: []string{"number"}, Classification: discovery.FieldClassMonetary},
+	}
+	fp := makeFingerprint("GET", "/api/v1/accounts/{id}/statement", "xhr",
+		discovery.JSONKindObject, fields, false, false)
+
+	cl := c.Classify(fp)
+	if cl.Category != discovery.CategoryStatements {
+		t.Errorf("expected statements, got %s (conf: %.2f)", cl.Category, cl.Confidence)
+	}
+	if cl.Confidence < 0.6 {
+		t.Errorf("expected confidence >= 0.6, got %.2f", cl.Confidence)
+	}
+}
+
+// TestClassifier_GenericArrayNotTransactions verifies that a plain array of primitives/objects
+// without transaction semantics is NOT classified as transactions.
+func TestClassifier_GenericArrayNotTransactions(t *testing.T) {
+	c := discovery.NewClassifier()
+	fields := []discovery.FieldSchema{
+		{Path: "$", ObservedTypes: []string{"array"}, Classification: discovery.FieldClassCollection},
+		{Path: "$[]", ObservedTypes: []string{"string"}},
+	}
+	fp := makeFingerprint("GET", "/api/v1/currencies", "xhr",
+		discovery.JSONKindArray, fields, true, false)
+
+	cl := c.Classify(fp)
+	if cl.Category == discovery.CategoryTransactions {
+		t.Errorf("generic array classified as transactions!")
+	}
+	if cl.Category != discovery.CategoryUnknown {
+		t.Logf("generic array classified as %s", cl.Category)
+	}
+}
+
+// TestClassifier_MisleadingFieldNames verifies that config objects with misleading
+// names like transactionTimeout are not classified as financial transactions.
+func TestClassifier_MisleadingFieldNames(t *testing.T) {
+	c := discovery.NewClassifier()
+	fields := []discovery.FieldSchema{
+		{Path: "$.transactionTimeoutSeconds", ObservedTypes: []string{"number"}},
+		{Path: "$.paymentGatewayEnabled", ObservedTypes: []string{"bool"}},
+		{Path: "$.appName", ObservedTypes: []string{"string"}},
+	}
+	fp := makeFingerprint("GET", "/api/v1/app/config", "xhr",
+		discovery.JSONKindObject, fields, false, false)
+
+	cl := c.Classify(fp)
+	if cl.Category != discovery.CategoryUnknown {
+		t.Errorf("misleading config object classified as %s", cl.Category)
+	}
+}
+
+// TestClassifier_FailedBodyRetrievalLowConfidence verifies that endpoints where body
+// retrieval failed do not receive high confidence.
+func TestClassifier_FailedBodyRetrievalLowConfidence(t *testing.T) {
+	c := discovery.NewClassifier()
+	// No schema fields, unknown kind
+	fp := makeFingerprint("GET", "/api/v1/accounts/{id}/transactions", "xhr",
+		discovery.JSONKindUnknown, nil, false, false)
+
+	cl := c.Classify(fp)
+	if cl.Confidence >= 0.5 {
+		t.Errorf("missing body endpoint received too high confidence: %.2f", cl.Confidence)
+	}
+	if cl.Category != discovery.CategoryUnknown {
+		t.Errorf("missing body endpoint should be unknown, got %s", cl.Category)
+	}
+}

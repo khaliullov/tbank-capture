@@ -7,13 +7,20 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/khaliullov/tbank-capture/internal/discovery"
 )
 
-// Store manages a bounded capture queue and persists raw responses to disk.
-// Raw storage is optional and must be explicitly enabled.
+// JobSubmitter provides an interface for non-blocking job submission to the capture store.
+type JobSubmitter interface {
+	Submit(job discovery.CaptureJob) bool
+}
+
+// Store manages a bounded capture queue and persists raw responses to disk if enabled.
+// It implements an explicit, thread-safe shutdown protocol.
 type Store struct {
 	log        *slog.Logger
 	rawDir     string
@@ -21,10 +28,14 @@ type Store struct {
 	queue      chan discovery.CaptureJob
 	collector  *discovery.Collector
 	done       chan struct{}
+
+	mu           sync.RWMutex
+	closed       bool
+	closeOnce    sync.Once
+	droppedCount atomic.Int64
 }
 
-// NewStore creates a Store. The queue channel is owned by the Store.
-// queueCap: bounded channel capacity.
+// NewStore creates a Store. The queue channel is owned and managed by the Store.
 func NewStore(
 	log *slog.Logger,
 	rawDir string,
@@ -32,6 +43,9 @@ func NewStore(
 	queueCap int,
 	collector *discovery.Collector,
 ) *Store {
+	if queueCap <= 0 {
+		queueCap = 128
+	}
 	return &Store{
 		log:        log,
 		rawDir:     rawDir,
@@ -42,28 +56,71 @@ func NewStore(
 	}
 }
 
-// Queue returns the write-end of the capture channel for the response handler.
+// Queue returns the write-end of the capture channel.
+// Prefer using Submit for race-safe submission during shutdown.
 func (s *Store) Queue() chan<- discovery.CaptureJob { return s.queue }
 
-// Run starts the store worker. It runs until ctx is cancelled and all queued
-// jobs are drained. Call this in a goroutine.
+// Submit attempts to enqueue a capture job non-blockingly.
+// It returns false if the queue is full or if the store has stopped accepting jobs.
+// It is guaranteed never to panic on a closed channel.
+func (s *Store) Submit(job discovery.CaptureJob) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.closed {
+		return false
+	}
+
+	select {
+	case s.queue <- job:
+		return true
+	default:
+		return false
+	}
+}
+
+// Close stops accepting new capture jobs and closes the internal queue channel.
+// It is idempotent and safe for concurrent calls.
+func (s *Store) Close() {
+	s.closeOnce.Do(func() {
+		s.mu.Lock()
+		s.closed = true
+		close(s.queue)
+		s.mu.Unlock()
+		s.log.Debug("store stopped accepting new jobs; queue closed")
+	})
+}
+
+// Run starts the store worker. It runs until the queue is drained after Close(),
+// or until ctx is cancelled. Call this in a dedicated goroutine.
 func (s *Store) Run(ctx context.Context) {
 	defer close(s.done)
 	for {
 		select {
 		case job, ok := <-s.queue:
 			if !ok {
+				s.log.Info("store worker drained queue and finished normally")
 				return
 			}
 			s.process(job)
+
 		case <-ctx.Done():
-			// Drain remaining jobs before exiting.
+			// Context cancellation: stop accepting and drain any pending jobs.
+			// All accepted jobs must either be processed or explicitly counted as dropped.
+			s.Close()
 			for {
 				select {
-				case job := <-s.queue:
-					s.process(job)
+				case job, ok := <-s.queue:
+					if !ok {
+						return
+					}
+					s.droppedCount.Add(1)
+					if s.collector != nil {
+						s.collector.IncrIgnored()
+					}
+					s.log.Warn("job dropped due to worker cancellation", "url", NormalizedURL(job.URL))
 				default:
-					s.log.Info("store worker drained and stopped")
+					s.log.Info("store worker cancelled; pending jobs drained and accounted for")
 					return
 				}
 			}
@@ -71,14 +128,18 @@ func (s *Store) Run(ctx context.Context) {
 	}
 }
 
-// Wait blocks until the store worker has exited.
+// Wait blocks until the store worker has finished processing and terminated.
 func (s *Store) Wait() { <-s.done }
 
-func (s *Store) process(job discovery.CaptureJob) {
-	// Forward to collector for fingerprinting and schema analysis.
-	s.collector.ProcessJob(job)
+// DroppedCount returns the count of accepted jobs that were dropped due to cancellation.
+func (s *Store) DroppedCount() int64 { return s.droppedCount.Load() }
 
-	// Persist raw body only when explicitly enabled and body is available.
+func (s *Store) process(job discovery.CaptureJob) {
+	if s.collector != nil {
+		s.collector.ProcessJob(job)
+	}
+
+	// Persist raw body only when explicitly enabled, body is present, and no auth secret was detected.
 	if s.rawEnabled && len(job.Body) > 0 {
 		if err := s.persistRaw(job); err != nil {
 			s.log.Warn("raw persist failed", "err", err)
@@ -126,7 +187,6 @@ func (s *Store) persistRaw(job discovery.CaptureJob) error {
 	return atomicWriteFile(path, data, 0600)
 }
 
-// atomicWriteFile writes data to path atomically via a temp file.
 func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, data, perm); err != nil {

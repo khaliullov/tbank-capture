@@ -3,5 +3,5 @@ data/browser-profile/
 data/raw/
 data/discovery/sessions/
 data/discovery/reports/
-tbank-capture
+/tbank-capture
 *.tmp

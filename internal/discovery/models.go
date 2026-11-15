@@ -120,3 +120,14 @@ type Session struct {
 	StoppedAt time.Time `json:"stopped_at,omitempty"`
 	Active    bool      `json:"active"`
 }
+
+// Metrics holds counters for discovery runtime telemetry.
+type Metrics struct {
+	TotalObserved         int `json:"total_observed"`
+	EligibleResponses     int `json:"eligible_responses"`
+	IgnoredResponses      int `json:"ignored_responses"`
+	CaptureFailures       int `json:"capture_failures"`
+	QueueOverflows        int `json:"queue_overflows"`
+	UniqueFingerprints    int `json:"unique_fingerprints"`
+	TransactionCandidates int `json:"transaction_candidates"`
+}

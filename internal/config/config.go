@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -37,39 +38,70 @@ type Config struct {
 	LogLevel string
 }
 
-// Load reads configuration from environment variables and validates required fields.
-// Secrets are never logged.
+// Load reads configuration from environment variables and validates all fields.
+// Secrets such as TELEGRAM_BOT_TOKEN are never included in error messages.
 func Load() (*Config, error) {
-	c := &Config{
-		UserDataDir:         envStr("USER_DATA_DIR", "./data/browser-profile"),
-		RawCaptureDir:       envStr("RAW_CAPTURE_DIR", "./data/raw"),
-		DiscoveryDir:        envStr("DISCOVERY_DIR", "./data/discovery"),
-		Headless:            envBool("HEADLESS", false),
-		RawCaptureEnabled:   envBool("DISCOVERY_RAW_CAPTURE", false),
-		MaxResponseBodySize: envInt64("MAX_RESPONSE_BODY_BYTES", 10*1024*1024),
-		CaptureQueueSize:    envInt("CAPTURE_QUEUE_SIZE", 128),
-		MaxJSONDepth:        envInt("MAX_JSON_DEPTH", 32),
-		MaxArrayElems:       envInt("MAX_ARRAY_ELEMENTS", 20),
-		MaxJSONFields:       envInt("MAX_JSON_FIELDS", 5000),
-		LogLevel:            strings.ToLower(envStr("LOG_LEVEL", "info")),
-	}
+	c := &Config{}
+	var err error
 
-	// Required: bot token
-	c.TelegramBotToken = os.Getenv("TELEGRAM_BOT_TOKEN")
+	// Required: bot token. Never log or format its value into errors.
+	c.TelegramBotToken = strings.TrimSpace(os.Getenv("TELEGRAM_BOT_TOKEN"))
 	if c.TelegramBotToken == "" {
 		return nil, errors.New("TELEGRAM_BOT_TOKEN is required")
 	}
 
-	// Required: chat ID
-	chatIDStr := os.Getenv("TELEGRAM_CHAT_ID")
+	// Required: chat ID.
+	chatIDStr := strings.TrimSpace(os.Getenv("TELEGRAM_CHAT_ID"))
 	if chatIDStr == "" {
 		return nil, errors.New("TELEGRAM_CHAT_ID is required")
 	}
-	chatID, err := strconv.ParseInt(strings.TrimSpace(chatIDStr), 10, 64)
+	c.TelegramChatID, err = strconv.ParseInt(chatIDStr, 10, 64)
 	if err != nil {
-		return nil, fmt.Errorf("TELEGRAM_CHAT_ID must be an integer: %w", err)
+		return nil, fmt.Errorf("invalid integer for TELEGRAM_CHAT_ID: %q", chatIDStr)
 	}
-	c.TelegramChatID = chatID
+	if c.TelegramChatID == 0 {
+		return nil, errors.New("TELEGRAM_CHAT_ID must be a non-zero integer")
+	}
+
+	// Paths
+	c.UserDataDir = filepath.Clean(envStr("USER_DATA_DIR", "./data/browser-profile"))
+	c.RawCaptureDir = filepath.Clean(envStr("RAW_CAPTURE_DIR", "./data/raw"))
+	c.DiscoveryDir = filepath.Clean(envStr("DISCOVERY_DIR", "./data/discovery"))
+
+	// Booleans
+	c.Headless, err = envBool("HEADLESS", false)
+	if err != nil {
+		return nil, err
+	}
+	c.RawCaptureEnabled, err = envBool("DISCOVERY_RAW_CAPTURE", false)
+	if err != nil {
+		return nil, err
+	}
+
+	// Integers and limits
+	c.MaxResponseBodySize, err = envInt64("MAX_RESPONSE_BODY_BYTES", 10*1024*1024)
+	if err != nil {
+		return nil, err
+	}
+	c.CaptureQueueSize, err = envInt("CAPTURE_QUEUE_SIZE", 128)
+	if err != nil {
+		return nil, err
+	}
+	c.MaxJSONDepth, err = envInt("MAX_JSON_DEPTH", 32)
+	if err != nil {
+		return nil, err
+	}
+	c.MaxArrayElems, err = envInt("MAX_ARRAY_ELEMENTS", 20)
+	if err != nil {
+		return nil, err
+	}
+	c.MaxJSONFields, err = envInt("MAX_JSON_FIELDS", 5000)
+	if err != nil {
+		return nil, err
+	}
+
+	// Logging
+	c.LogLevel = strings.ToLower(envStr("LOG_LEVEL", "info"))
 
 	if err := c.validate(); err != nil {
 		return nil, err
@@ -78,6 +110,16 @@ func Load() (*Config, error) {
 }
 
 func (c *Config) validate() error {
+	if c.UserDataDir == "" || c.UserDataDir == "." && envIsSet("USER_DATA_DIR") && os.Getenv("USER_DATA_DIR") == "" {
+		return errors.New("USER_DATA_DIR must not be empty")
+	}
+	if c.RawCaptureDir == "" {
+		return errors.New("RAW_CAPTURE_DIR must not be empty")
+	}
+	if c.DiscoveryDir == "" {
+		return errors.New("DISCOVERY_DIR must not be empty")
+	}
+
 	if c.MaxResponseBodySize <= 0 {
 		return errors.New("MAX_RESPONSE_BODY_BYTES must be positive")
 	}
@@ -93,6 +135,7 @@ func (c *Config) validate() error {
 	if c.MaxJSONFields <= 0 {
 		return errors.New("MAX_JSON_FIELDS must be positive")
 	}
+
 	validLevels := map[string]bool{"debug": true, "info": true, "warn": true, "error": true}
 	if !validLevels[c.LogLevel] {
 		return fmt.Errorf("LOG_LEVEL must be one of debug/info/warn/error, got: %q", c.LogLevel)
@@ -100,46 +143,54 @@ func (c *Config) validate() error {
 	return nil
 }
 
+func envIsSet(key string) bool {
+	_, ok := os.LookupEnv(key)
+	return ok
+}
+
 func envStr(key, def string) string {
-	v := os.Getenv(key)
-	if v == "" {
+	v, ok := os.LookupEnv(key)
+	if !ok || strings.TrimSpace(v) == "" {
 		return def
 	}
-	return v
+	return strings.TrimSpace(v)
 }
 
-func envBool(key string, def bool) bool {
-	v := os.Getenv(key)
-	if v == "" {
-		return def
+func envBool(key string, def bool) (bool, error) {
+	v, ok := os.LookupEnv(key)
+	if !ok || strings.TrimSpace(v) == "" {
+		return def, nil
 	}
-	b, err := strconv.ParseBool(v)
+	trimmed := strings.TrimSpace(v)
+	b, err := strconv.ParseBool(trimmed)
 	if err != nil {
-		return def
+		return false, fmt.Errorf("invalid boolean value for %s: %q", key, trimmed)
 	}
-	return b
+	return b, nil
 }
 
-func envInt(key string, def int) int {
-	v := os.Getenv(key)
-	if v == "" {
-		return def
+func envInt(key string, def int) (int, error) {
+	v, ok := os.LookupEnv(key)
+	if !ok || strings.TrimSpace(v) == "" {
+		return def, nil
 	}
-	n, err := strconv.Atoi(strings.TrimSpace(v))
-	if err != nil || n <= 0 {
-		return def
+	trimmed := strings.TrimSpace(v)
+	n, err := strconv.Atoi(trimmed)
+	if err != nil {
+		return 0, fmt.Errorf("invalid integer value for %s: %q", key, trimmed)
 	}
-	return n
+	return n, nil
 }
 
-func envInt64(key string, def int64) int64 {
-	v := os.Getenv(key)
-	if v == "" {
-		return def
+func envInt64(key string, def int64) (int64, error) {
+	v, ok := os.LookupEnv(key)
+	if !ok || strings.TrimSpace(v) == "" {
+		return def, nil
 	}
-	n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
-	if err != nil || n <= 0 {
-		return def
+	trimmed := strings.TrimSpace(v)
+	n, err := strconv.ParseInt(trimmed, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid integer value for %s: %q", key, trimmed)
 	}
-	return n
+	return n, nil
 }

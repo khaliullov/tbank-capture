@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-// Collector aggregates endpoint observations and builds fingerprints.
+// Collector aggregates endpoint observations and builds fingerprints for discovery sessions.
 // It is safe for concurrent use.
 type Collector struct {
 	log         *slog.Logger
@@ -25,9 +25,9 @@ type Collector struct {
 	mu           sync.Mutex
 	session      *Session
 	fingerprints map[FingerprintID]*EndpointFingerprint
-	bodyHashes   map[FingerprintID]map[string]bool // tracks unique bodies per FP
+	bodyHashes   map[FingerprintID]map[string]bool
 
-	// Metrics (read with Metrics()).
+	// Metrics
 	totalObserved     int
 	eligibleResponses int
 	ignoredResponses  int
@@ -35,7 +35,7 @@ type Collector struct {
 	queueOverflows    int
 }
 
-// NewCollector creates a Collector. sessionDir is the data/discovery/sessions directory.
+// NewCollector creates a Collector. sessionDir is where session state JSON files are saved.
 func NewCollector(log *slog.Logger, sessionDir string, cfg AnalyzerConfig) *Collector {
 	return &Collector{
 		log:          log,
@@ -47,18 +47,7 @@ func NewCollector(log *slog.Logger, sessionDir string, cfg AnalyzerConfig) *Coll
 	}
 }
 
-// Metrics holds counters for telemetry.
-type Metrics struct {
-	TotalObserved         int
-	EligibleResponses     int
-	IgnoredResponses      int
-	CaptureFailures       int
-	QueueOverflows        int
-	UniqueFingerprints    int
-	TransactionCandidates int
-}
-
-// Metrics returns a snapshot of current counters.
+// Metrics returns a snapshot of current telemetry counters.
 func (c *Collector) Metrics() Metrics {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -85,7 +74,7 @@ func (c *Collector) IncrQueueOverflow() {
 	c.mu.Unlock()
 }
 
-// IncrIgnored increments the ignored counter.
+// IncrIgnored increments the ignored counter and total observed counter.
 func (c *Collector) IncrIgnored() {
 	c.mu.Lock()
 	c.ignoredResponses++
@@ -93,10 +82,16 @@ func (c *Collector) IncrIgnored() {
 	c.mu.Unlock()
 }
 
-// StartSession begins a new discovery session.
+// StartSession begins a new discovery session. Any previous session is stopped.
 func (c *Collector) StartSession(id SessionID) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	if c.session != nil && c.session.Active {
+		c.session.Active = false
+		c.session.StoppedAt = time.Now().UTC()
+	}
+
 	c.session = &Session{
 		ID:        id,
 		StartedAt: time.Now().UTC(),
@@ -112,33 +107,50 @@ func (c *Collector) StartSession(id SessionID) {
 	c.log.Info("discovery session started", "sessionID", id)
 }
 
-// ActiveSession returns the current session, or nil.
+// ActiveSession returns a snapshot copy of the current session, or nil if no session exists.
 func (c *Collector) ActiveSession() *Session {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.session
+	if c.session == nil {
+		return nil
+	}
+	cp := *c.session
+	return &cp
 }
 
-// ProcessJob processes a captured response job, updating fingerprints.
+// ProcessJob validates the job against the active session and updates endpoint fingerprints.
+// Jobs from inactive or mismatched sessions are rejected to ensure strict session isolation.
 func (c *Collector) ProcessJob(job CaptureJob) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.totalObserved++
 
-	if job.BodyError != "" {
-		c.captureFailures++
-		c.log.Warn("body retrieval failed", "url", sanitizeURLForLog(job.URL), "err", job.BodyError)
+	// Strict session validation: job must match the active session.
+	if c.session == nil || !c.session.Active || job.SessionID == "" || job.SessionID != c.session.ID {
+		c.ignoredResponses++
+		return
 	}
 
-	// Analyze JSON structure if body available.
+	c.totalObserved++
+
+	var warnings []string
+	if job.BodyError != "" {
+		c.captureFailures++
+		warningMsg := fmt.Sprintf("body retrieval failed: %s", job.BodyError)
+		warnings = append(warnings, warningMsg)
+		c.log.Debug("body retrieval issue", "url", sanitizeURLForLog(job.URL), "err", job.BodyError)
+	}
+
+	// Analyze JSON structure if body is available.
 	var fields []FieldSchema
-	var topKind JSONKind
+	var topKind JSONKind = JSONKindUnknown
 	if len(job.Body) > 0 {
 		var err error
 		fields, topKind, err = AnalyzeJSON(job.Body, c.analyzerCfg)
 		if err != nil {
 			c.captureFailures++
-			c.log.Warn("json analysis failed", "err", err)
+			warningMsg := fmt.Sprintf("json analysis error: %s", err)
+			warnings = append(warnings, warningMsg)
+			c.log.Debug("json analysis issue", "err", err)
 		}
 	}
 
@@ -150,25 +162,28 @@ func (c *Collector) ProcessJob(job CaptureJob) {
 	fp, exists := c.fingerprints[fpID]
 	if !exists {
 		fp = &EndpointFingerprint{
-			ID:             fpID,
-			SessionID:      job.SessionID,
-			Method:         job.Method,
-			NormalizedPath: normPath,
-			ExampleURL:     stripQueryAndCreds(job.URL),
-			ContentType:    job.ContentType,
-			ResourceType:   job.ResourceType,
-			TopLevelKind:   topKind,
-			StructureHash:  structHash,
-			SchemaFields:   fields,
-			StatusDist:     make(StatusDist),
-			FirstSeen:      now,
+			ID:              fpID,
+			SessionID:       c.session.ID,
+			Method:          job.Method,
+			NormalizedPath:  normPath,
+			ExampleURL:      stripQueryAndCreds(job.URL),
+			ContentType:     job.ContentType,
+			ResourceType:    job.ResourceType,
+			TopLevelKind:    topKind,
+			StructureHash:   structHash,
+			SchemaFields:    fields,
+			StatusDist:      make(StatusDist),
+			FirstSeen:       now,
+			CaptureWarnings: warnings,
 		}
 		c.fingerprints[fpID] = fp
 		c.bodyHashes[fpID] = make(map[string]bool)
 		c.log.Info("new endpoint fingerprint", "id", fpID, "path", normPath)
+	} else if len(warnings) > 0 {
+		fp.CaptureWarnings = appendUniqueStrings(fp.CaptureWarnings, warnings)
 	}
 
-	// Update fingerprint.
+	// Update fingerprint metrics
 	fp.LastSeen = now
 	fp.Observations++
 	fp.StatusDist[job.Status]++
@@ -180,16 +195,14 @@ func (c *Collector) ProcessJob(job CaptureJob) {
 		fp.HasDateParams = true
 	}
 
-	// Check for pagination signals.
 	if !fp.IsPaginated && hasPaginationSignal(fields) {
 		fp.IsPaginated = true
 	}
-	// Check if returns a list.
 	if topKind == JSONKindArray || hasList(fields) {
 		fp.ReturnsList = true
 	}
 
-	// Track unique bodies by hash.
+	// Track unique response bodies by hash.
 	if len(job.Body) > 0 {
 		h := quickHash(job.Body)
 		if !c.bodyHashes[fpID][h] {
@@ -198,73 +211,124 @@ func (c *Collector) ProcessJob(job CaptureJob) {
 		}
 	}
 
-	// Merge new fields into existing schema (new paths encountered later).
-	fp.SchemaFields = mergeFields(fp.SchemaFields, fields)
-	// Recompute classification.
+	// Merge new fields and recalculate optionality across observations.
+	fp.SchemaFields = mergeFields(fp.SchemaFields, fields, fp.Observations)
+
+	// Recompute classification with latest evidence.
 	fp.Classification = c.classifier.Classify(fp)
 
 	c.eligibleResponses++
 }
 
-// StopSession marks the session as stopped and returns its value.
+// StopSession marks the active session as stopped and returns a snapshot copy.
 func (c *Collector) StopSession() *Session {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.session != nil {
+	if c.session != nil && c.session.Active {
 		c.session.StoppedAt = time.Now().UTC()
 		c.session.Active = false
 	}
-	return c.session
+	if c.session == nil {
+		return nil
+	}
+	cp := *c.session
+	return &cp
 }
 
-// Fingerprints returns a copy of all current fingerprints.
+// Fingerprints returns a deep-copy snapshot of all collected fingerprints.
 func (c *Collector) Fingerprints() []*EndpointFingerprint {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	fps := make([]*EndpointFingerprint, 0, len(c.fingerprints))
 	for _, fp := range c.fingerprints {
-		copy := *fp
-		fps = append(fps, &copy)
+		fps = append(fps, cloneFingerprint(fp))
 	}
 	sort.Slice(fps, func(i, j int) bool {
-		return fps[i].Classification.Confidence > fps[j].Classification.Confidence
+		if fps[i].Classification.Confidence != fps[j].Classification.Confidence {
+			return fps[i].Classification.Confidence > fps[j].Classification.Confidence
+		}
+		return fps[i].NormalizedPath < fps[j].NormalizedPath
 	})
 	return fps
 }
 
-// PersistSession writes session metadata to disk.
+// PersistSession writes the session metadata and fingerprints snapshot to disk atomically.
 func (c *Collector) PersistSession() error {
 	c.mu.Lock()
-	sess := c.session
+	if c.session == nil {
+		c.mu.Unlock()
+		return nil
+	}
+	sessCopy := *c.session
 	fps := make([]*EndpointFingerprint, 0, len(c.fingerprints))
 	for _, fp := range c.fingerprints {
-		copy := *fp
-		fps = append(fps, &copy)
+		fps = append(fps, cloneFingerprint(fp))
 	}
 	c.mu.Unlock()
 
-	if sess == nil {
-		return nil
-	}
 	if err := os.MkdirAll(c.sessionDir, 0700); err != nil {
 		return fmt.Errorf("create session dir: %w", err)
 	}
-	sessFile := filepath.Join(c.sessionDir, fmt.Sprintf("%s.json", sess.ID))
+
+	sessFile := filepath.Join(c.sessionDir, fmt.Sprintf("%s.json", sessCopy.ID))
 	type persisted struct {
-		Session      *Session               `json:"session"`
+		Session      Session                `json:"session"`
 		Fingerprints []*EndpointFingerprint `json:"fingerprints"`
 	}
-	data, err := json.MarshalIndent(persisted{Session: sess, Fingerprints: fps}, "", "  ")
+	data, err := json.MarshalIndent(persisted{Session: sessCopy, Fingerprints: fps}, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal session: %w", err)
 	}
+
 	return atomicWriteFile(sessFile, data, 0600)
+}
+
+// cloneFingerprint creates a deep copy of an EndpointFingerprint.
+func cloneFingerprint(fp *EndpointFingerprint) *EndpointFingerprint {
+	if fp == nil {
+		return nil
+	}
+	cp := *fp
+
+	// Deep copy SchemaFields
+	if fp.SchemaFields != nil {
+		cp.SchemaFields = make([]FieldSchema, len(fp.SchemaFields))
+		for i, f := range fp.SchemaFields {
+			fCopy := f
+			if f.ObservedTypes != nil {
+				fCopy.ObservedTypes = make([]string, len(f.ObservedTypes))
+				copy(fCopy.ObservedTypes, f.ObservedTypes)
+			}
+			cp.SchemaFields[i] = fCopy
+		}
+	}
+
+	// Deep copy StatusDist map
+	if fp.StatusDist != nil {
+		cp.StatusDist = make(StatusDist, len(fp.StatusDist))
+		for k, v := range fp.StatusDist {
+			cp.StatusDist[k] = v
+		}
+	}
+
+	// Deep copy Classification reasons
+	if fp.Classification.Reasons != nil {
+		cp.Classification.Reasons = make([]string, len(fp.Classification.Reasons))
+		copy(cp.Classification.Reasons, fp.Classification.Reasons)
+	}
+
+	// Deep copy CaptureWarnings
+	if fp.CaptureWarnings != nil {
+		cp.CaptureWarnings = make([]string, len(fp.CaptureWarnings))
+		copy(cp.CaptureWarnings, fp.CaptureWarnings)
+	}
+
+	return &cp
 }
 
 // --- helpers ---
 
 func extractPath(rawURL string) string {
-	// Extract path without query or credentials.
 	u := strings.TrimPrefix(rawURL, "https://")
 	u = strings.TrimPrefix(u, "http://")
 	if idx := strings.Index(u, "/"); idx >= 0 {
@@ -278,11 +342,9 @@ func extractPath(rawURL string) string {
 }
 
 func stripQueryAndCreds(rawURL string) string {
-	// Return scheme + host + path only.
 	for _, prefix := range []string{"https://", "http://"} {
 		if strings.HasPrefix(rawURL, prefix) {
 			rest := rawURL[len(prefix):]
-			// Remove credentials user:pass@
 			if atIdx := strings.Index(rest, "@"); atIdx >= 0 {
 				slashIdx := strings.Index(rest, "/")
 				if atIdx < slashIdx || slashIdx < 0 {
@@ -336,14 +398,13 @@ func hasList(fields []FieldSchema) bool {
 	return false
 }
 
-func mergeFields(existing, incoming []FieldSchema) []FieldSchema {
+func mergeFields(existing, incoming []FieldSchema, totalObservations int) []FieldSchema {
 	byPath := make(map[string]int, len(existing))
 	for i, f := range existing {
 		byPath[f.Path] = i
 	}
 	for _, f := range incoming {
 		if idx, ok := byPath[f.Path]; ok {
-			// Merge types.
 			existing[idx].Count += f.Count
 			typeSet := map[string]bool{}
 			for _, t := range existing[idx].ObservedTypes {
@@ -359,7 +420,33 @@ func mergeFields(existing, incoming []FieldSchema) []FieldSchema {
 			byPath[f.Path] = len(existing) - 1
 		}
 	}
+
+	// Update optionality across observations: if a field was not present in all observations
+	for i := range existing {
+		if totalObservations > 1 && existing[i].Count < totalObservations {
+			existing[i].Optional = true
+		}
+	}
+
 	return existing
+}
+
+func appendUniqueStrings(slice []string, items []string) []string {
+	seen := make(map[string]bool, len(slice)+len(items))
+	var out []string
+	for _, s := range slice {
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	for _, s := range items {
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 func quickHash(data []byte) string {
@@ -370,7 +457,7 @@ func quickHash(data []byte) string {
 func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, data, perm); err != nil {
-		return fmt.Errorf("write temp file: %w", err)
+		return fmt.Errorf("write temp: %w", err)
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		_ = os.Remove(tmp)

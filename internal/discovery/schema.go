@@ -23,14 +23,25 @@ func DefaultAnalyzerConfig() AnalyzerConfig {
 // describing its structure. Values are never returned — only paths, types,
 // and heuristic classifications.
 func AnalyzeJSON(data []byte, cfg AnalyzerConfig) ([]FieldSchema, JSONKind, error) {
+	if cfg.MaxDepth <= 0 {
+		cfg.MaxDepth = 32
+	}
+	if cfg.MaxArrayElems <= 0 {
+		cfg.MaxArrayElems = 20
+	}
+	if cfg.MaxFields <= 0 {
+		cfg.MaxFields = 5000
+	}
+
 	var root interface{}
 	if err := json.Unmarshal(data, &root); err != nil {
 		return nil, JSONKindUnknown, fmt.Errorf("json unmarshal: %w", err)
 	}
 
-	a := &analyzer{cfg: cfg}
+	a := newAnalyzer(cfg)
 	a.walk("$", root, 0, false)
-	return a.fields, topKind(root), nil
+
+	return a.results(), topKind(root), nil
 }
 
 func topKind(v interface{}) JSONKind {
@@ -52,26 +63,30 @@ func topKind(v interface{}) JSONKind {
 	}
 }
 
-type analyzer struct {
-	cfg    AnalyzerConfig
-	fields []FieldSchema
-	total  int
+type schemaEntry struct {
+	path           string
+	types          map[string]bool
+	count          int
+	inArray        bool
+	nested         bool
+	optional       bool
+	classification FieldClassification
 }
 
-// fieldMap tracks per-path aggregation during a single analysis pass.
-// (For cross-observation aggregation see collector.go.)
-type schemaEntry struct {
-	types   map[string]bool
-	count   int
-	inArray bool
-	nested  bool
+type analyzer struct {
+	cfg     AnalyzerConfig
+	entries map[string]*schemaEntry
+}
+
+func newAnalyzer(cfg AnalyzerConfig) *analyzer {
+	return &analyzer{
+		cfg:     cfg,
+		entries: make(map[string]*schemaEntry, 64),
+	}
 }
 
 func (a *analyzer) walk(path string, v interface{}, depth int, inArray bool) {
 	if depth > a.cfg.MaxDepth {
-		return
-	}
-	if a.total >= a.cfg.MaxFields {
 		return
 	}
 
@@ -79,90 +94,116 @@ func (a *analyzer) walk(path string, v interface{}, depth int, inArray bool) {
 
 	switch val := v.(type) {
 	case map[string]interface{}:
-		// Record the object node itself only if it is a child (not root "$").
 		if path != "$" {
-			a.emit(path, typeName, depth > 1, inArray)
+			a.recordField(path, typeName, depth > 1, inArray)
 		}
-		// Sort keys for deterministic output.
+
+		// Sort keys for deterministic traversal.
 		keys := make([]string, 0, len(val))
 		for k := range val {
 			keys = append(keys, k)
 		}
 		sort.Strings(keys)
+
 		for _, k := range keys {
-			childPath := path + "." + k
-			a.walk(childPath, val[k], depth+1, false)
+			childPath := formatPropertyPath(path, k)
+			a.walk(childPath, val[k], depth+1, inArray)
 		}
 
 	case []interface{}:
 		if path != "$" {
-			a.emitCollection(path, depth > 1, inArray)
+			a.recordCollection(path, depth > 1, inArray)
 		}
+
 		limit := len(val)
 		if limit > a.cfg.MaxArrayElems {
 			limit = a.cfg.MaxArrayElems
 		}
+
+		elemPath := path + "[]"
 		for i := 0; i < limit; i++ {
-			a.walk(path+"[]", val[i], depth+1, true)
+			a.walk(elemPath, val[i], depth+1, true)
 		}
 
 	default:
 		if path != "$" {
-			a.emit(path, typeName, depth > 1, inArray)
+			a.recordField(path, typeName, depth > 1, inArray)
 		}
 	}
 }
 
-func (a *analyzer) emit(path, typeName string, nested, inArray bool) {
-	if a.total >= a.cfg.MaxFields {
+func (a *analyzer) recordField(path, typeName string, nested, inArray bool) {
+	e, exists := a.entries[path]
+	if exists {
+		e.count++
+		e.types[typeName] = true
 		return
 	}
-	// Find or create entry for this path.
-	for i := range a.fields {
-		if a.fields[i].Path == path {
-			a.fields[i].Count++
-			// Merge type.
-			found := false
-			for _, t := range a.fields[i].ObservedTypes {
-				if t == typeName {
-					found = true
-					break
-				}
-			}
-			if !found {
-				a.fields[i].ObservedTypes = append(a.fields[i].ObservedTypes, typeName)
-			}
-			return
-		}
+
+	if len(a.entries) >= a.cfg.MaxFields {
+		return
 	}
-	a.total++
-	f := FieldSchema{
-		Path:          path,
-		ObservedTypes: []string{typeName},
-		Count:         1,
-		InArray:       inArray,
-		Nested:        nested,
+
+	a.entries[path] = &schemaEntry{
+		path:           path,
+		types:          map[string]bool{typeName: true},
+		count:          1,
+		inArray:        inArray,
+		nested:         nested,
+		classification: classifyField(path, typeName),
 	}
-	f.Classification = classifyField(path, typeName)
-	a.fields = append(a.fields, f)
 }
 
-func (a *analyzer) emitCollection(path string, nested, inArray bool) {
-	for i := range a.fields {
-		if a.fields[i].Path == path {
-			a.fields[i].Count++
-			return
+func (a *analyzer) recordCollection(path string, nested, inArray bool) {
+	e, exists := a.entries[path]
+	if exists {
+		e.count++
+		e.types["array"] = true
+		return
+	}
+
+	if len(a.entries) >= a.cfg.MaxFields {
+		return
+	}
+
+	a.entries[path] = &schemaEntry{
+		path:           path,
+		types:          map[string]bool{"array": true},
+		count:          1,
+		inArray:        inArray,
+		nested:         nested,
+		classification: FieldClassCollection,
+	}
+}
+
+// results produces deterministically ordered FieldSchema entries.
+func (a *analyzer) results() []FieldSchema {
+	paths := make([]string, 0, len(a.entries))
+	for p := range a.entries {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+
+	out := make([]FieldSchema, len(paths))
+	for i, p := range paths {
+		e := a.entries[p]
+		sortedTypes := make([]string, 0, len(e.types))
+		for t := range e.types {
+			sortedTypes = append(sortedTypes, t)
+		}
+		sort.Strings(sortedTypes)
+
+		out[i] = FieldSchema{
+			Path:           e.path,
+			ObservedTypes:  sortedTypes,
+			Count:          e.count,
+			Optional:       e.optional,
+			InArray:        e.inArray,
+			Nested:         e.nested,
+			Classification: e.classification,
 		}
 	}
-	a.total++
-	a.fields = append(a.fields, FieldSchema{
-		Path:           path,
-		ObservedTypes:  []string{"array"},
-		Count:          1,
-		InArray:        inArray,
-		Nested:         nested,
-		Classification: FieldClassCollection,
-	})
+	return out
 }
 
 func jsonTypeName(v interface{}) string {
@@ -184,60 +225,111 @@ func jsonTypeName(v interface{}) string {
 	}
 }
 
-// classifyField uses field name heuristics to infer semantic role.
-// It never inspects field values.
-func classifyField(path, typeName string) FieldClassification {
-	// Extract the leaf key name from the path.
-	leaf := path
-	if idx := strings.LastIndexAny(path, ".[]"); idx >= 0 {
-		candidate := path[idx+1:]
-		if candidate != "" {
-			leaf = candidate
+// formatPropertyPath cleanly joins parent JSONPath with a child property key.
+// Normal alphanumeric keys use dot-notation: $.items.id
+// Keys containing dots, brackets, quotes, or special characters use bracket notation:
+// $["foo.bar"] or $.items[]["special-key"]
+func formatPropertyPath(parent, key string) string {
+	if isSimpleIdentifier(key) {
+		if parent == "$" {
+			return "$." + key
 		}
+		return parent + "." + key
 	}
+
+	escaped := strings.ReplaceAll(key, `\`, `\\`)
+	escaped = strings.ReplaceAll(escaped, `"`, `\"`)
+	return fmt.Sprintf(`%s["%s"]`, parent, escaped)
+}
+
+func isSimpleIdentifier(s string) bool {
+	if len(s) == 0 {
+		return false
+	}
+	for i, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || r == '_' {
+			continue
+		}
+		if i > 0 && r >= '0' && r <= '9' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// classifyField uses field name heuristics to infer semantic role without inspecting values.
+func classifyField(path, typeName string) FieldClassification {
+	leaf := extractLeafName(path)
 	lower := strings.ToLower(leaf)
 
-	// Identifier heuristics.
 	if isIdentifierField(lower, typeName) {
 		return FieldClassIdentifier
 	}
-	// Timestamp heuristics.
 	if isTimestampField(lower) {
 		return FieldClassTimestamp
 	}
-	// Monetary heuristics.
 	if isMonetaryField(lower, typeName) {
 		return FieldClassMonetary
 	}
-	// Status heuristics.
 	if isStatusField(lower, typeName) {
 		return FieldClassStatus
 	}
-	// MCC heuristics.
 	if isMCCField(lower, typeName) {
 		return FieldClassMCC
 	}
-	// Merchant heuristics.
 	if isMerchantField(lower) {
 		return FieldClassMerchant
 	}
 	return FieldClassNone
 }
 
+func fieldLeaf(path string) string {
+	return extractLeafName(path)
+}
+
+func extractLeafName(path string) string {
+	// Handle bracket notation: e.g. $["user.name"] or $.items[]["key"]
+	if strings.HasSuffix(path, `"]`) {
+		idx := strings.LastIndex(path, `["`)
+		if idx >= 0 {
+			inner := path[idx+2 : len(path)-2]
+			inner = strings.ReplaceAll(inner, `\"`, `"`)
+			inner = strings.ReplaceAll(inner, `\\`, `\`)
+			return inner
+		}
+	}
+
+	// Normal dot or array notation
+	idx := strings.LastIndexAny(path, ".[]")
+	if idx < 0 {
+		return path
+	}
+	candidate := path[idx+1:]
+	if candidate != "" {
+		return candidate
+	}
+	return path
+}
+
 func isIdentifierField(lower, typeName string) bool {
-	idWords := []string{"id", "uuid", "guid", "key", "ref", "token", "code", "number"}
+	if strings.Contains(lower, "timeout") || strings.Contains(lower, "period") {
+		return false
+	}
+	idWords := []string{"id", "uuid", "guid", "key", "ref", "code", "number", "pan"}
 	for _, w := range idWords {
-		if lower == w || strings.HasSuffix(lower, "id") || strings.HasSuffix(lower, "uuid") {
+		if lower == w || strings.HasSuffix(lower, "id") || strings.HasSuffix(lower, "uuid") || strings.HasSuffix(lower, "number") {
 			return true
 		}
-		_ = w
 	}
-	// Pure "id" or ends with "Id"
-	return lower == "id" || strings.HasSuffix(lower, "id") || strings.HasSuffix(lower, "uuid")
+	return false
 }
 
 func isTimestampField(lower string) bool {
-	tsWords := []string{"time", "date", "at", "timestamp", "created", "updated", "posted", "executed", "processed", "authorized", "booking"}
+	if strings.Contains(lower, "timeout") {
+		return false
+	}
+	tsWords := []string{"time", "date", "timestamp", "created", "updated", "posted", "executed", "processed", "authorized", "booking"}
 	for _, w := range tsWords {
 		if strings.Contains(lower, w) {
 			return true
@@ -250,7 +342,7 @@ func isMonetaryField(lower, typeName string) bool {
 	if typeName != "number" && typeName != "string" {
 		return false
 	}
-	monWords := []string{"amount", "sum", "total", "balance", "credit", "debit", "fee", "charge", "price", "value"}
+	monWords := []string{"amount", "sum", "total", "balance", "credit", "debit", "fee", "charge", "price", "commission"}
 	for _, w := range monWords {
 		if strings.Contains(lower, w) {
 			return true
@@ -263,18 +355,18 @@ func isStatusField(lower, typeName string) bool {
 	if typeName != "string" && typeName != "number" {
 		return false
 	}
-	return lower == "status" || lower == "state" || lower == "type" && strings.Contains(lower, "status")
+	return lower == "status" || lower == "state" || strings.HasSuffix(lower, "status") || strings.HasSuffix(lower, "state")
 }
 
 func isMCCField(lower, typeName string) bool {
 	if typeName != "number" && typeName != "string" {
 		return false
 	}
-	return lower == "mcc" || lower == "mcccode" || strings.Contains(lower, "mcc")
+	return lower == "mcc" || lower == "mcccode" || strings.HasSuffix(lower, "mcc")
 }
 
 func isMerchantField(lower string) bool {
-	merchantWords := []string{"merchant", "shop", "store", "vendor", "payee", "recipient", "counterparty", "partner"}
+	merchantWords := []string{"merchant", "shop", "store", "vendor", "payee", "counterparty"}
 	for _, w := range merchantWords {
 		if strings.Contains(lower, w) {
 			return true
