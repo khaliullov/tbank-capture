@@ -1,0 +1,7 @@
+.idea/
+data/browser-profile/
+data/raw/
+data/discovery/sessions/
+data/discovery/reports/
+tbank-capture
+*.tmp
