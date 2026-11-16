@@ -148,20 +148,100 @@ LOG_LEVEL=info
 
 ### Prerequisites
 
-- Go 1.21 or newer
-- Telegram account and bot token ([BotFather](https://t.me/BotFather))
-- Your Telegram numeric user ID ([@userinfobot](https://t.me/userinfobot))
+- **Go**: 1.21 or newer ([golang.org](https://go.dev/dl/))
+- **Node.js** *(recommended, but not required)*: If Node.js is not installed locally, the installation script will automatically download a standalone Node.js binary.
+- **Telegram Bot Token**: From [@BotFather](https://t.me/BotFather)
+- **Telegram Chat ID**: Your private numeric Telegram user ID from [@userinfobot](https://t.me/userinfobot)
 
-### Install Playwright Chromium
+### Automated Installation (One Command)
+
+Install the version-matched Playwright driver and the Chromium browser binary:
 
 ```bash
-go run github.com/playwright-community/playwright-go/cmd/playwright@v0.4802.0 install chromium
+make playwright-install
 ```
 
-### Build
+Or run the script directly:
 
 ```bash
-go build -o tbank-capture ./cmd/tbank-capture/
+./scripts/install-playwright.sh
+```
+
+The installation script:
+1. Derives the required Playwright driver version (v1.48.2) directly from `go.mod`.
+2. Downloads and configures the driver in your local cache (`~/Library/Caches/ms-playwright-go` on macOS, `~/.cache/ms-playwright-go` on Linux, `%LOCALAPPDATA%\ms-playwright-go` on Windows).
+3. Installs the exact Chromium revision (`chromium-1140`) required by the driver.
+4. Avoids installing unrelated browsers (Firefox, WebKit).
+5. Is completely idempotent and safe to re-run.
+
+### Verifying the Installation
+
+To verify that both the Playwright driver and Chromium executable are available without starting the browser or Telegram bot:
+
+```bash
+make playwright-check
+```
+
+Or using the CLI directly:
+
+```bash
+./tbank-capture --check-playwright
+```
+
+Expected output:
+```text
+Playwright preflight check passed: driver and Chromium are available.
+```
+
+### Linux-Specific Dependencies
+
+On fresh Linux installations (Ubuntu, Debian, Fedora, Arch), Chromium requires system graphic and font libraries (e.g. `libnss3`, `libatk`, `libxcomposite`).
+
+You can install these dependencies using:
+
+```bash
+./scripts/install-playwright.sh --with-deps
+```
+
+Or install them manually on Debian/Ubuntu:
+```bash
+sudo apt-get update && sudo apt-get install -y \
+  libglib2.0-0 libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 \
+  libcups2 libdrm2 libdbus-1-3 libxcb1 libxkbcommon0 libx11-6 \
+  libxcomposite1 libxdamage1 libxext6 libxfixes3 libxrandr2 \
+  libgbm1 libpango-1.0-0 libcairo2 libasound2
+```
+
+### Troubleshooting: "please install the driver first"
+
+If you encounter:
+```text
+Playwright initialization failed:
+  driver: not installed or incompatible
+  required version: v1.48.2
+
+Run:
+  make playwright-install
+```
+or the legacy Playwright Go message:
+```text
+fatal: browser start: run playwright: please install the driver (v1.48.2) first: %!w(<nil>)
+```
+
+**Cause**: Microsoft permanently retired the legacy Azure CDN driver download bucket (`playwright.azureedge.net/builds/driver/`), causing unpatched driver downloads to fail with HTTP 404.
+
+**Resolution**:
+Run:
+```bash
+make playwright-install
+```
+This fetches the version-matched `playwright-core` package from the official npm registry, places the driver into your local cache directory, and installs the Chromium binary.
+
+### Build Application
+
+```bash
+make build
+# or: go build -o tbank-capture ./cmd/tbank-capture/
 ```
 
 ---

@@ -20,6 +20,17 @@ import (
 )
 
 func main() {
+	for _, arg := range os.Args[1:] {
+		if arg == "--check-playwright" || arg == "-check-playwright" {
+			if err := browser.CheckPlaywright(); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			fmt.Println("Playwright preflight check passed: driver and Chromium are available.")
+			os.Exit(0)
+		}
+	}
+
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "fatal: %v\n", err)
 		os.Exit(1)

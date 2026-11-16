@@ -22,6 +22,7 @@ type Manager struct {
 	playwright *pw.Playwright
 	context    pw.BrowserContext
 	pages      []pw.Page
+	checker    PreflightChecker
 }
 
 // NewManager creates a Manager. Call Start to launch the browser.
@@ -30,7 +31,15 @@ func NewManager(log *slog.Logger, userDataDir string, headless bool) *Manager {
 		log:         log,
 		userDataDir: userDataDir,
 		headless:    headless,
+		checker:     NewPreflightChecker(),
 	}
+}
+
+// SetPreflightChecker configures a custom preflight checker (useful for testing).
+func (m *Manager) SetPreflightChecker(c PreflightChecker) {
+	m.mu.Lock()
+	m.checker = c
+	m.mu.Unlock()
 }
 
 // Start launches Playwright and opens a persistent Chromium context.
@@ -39,14 +48,26 @@ func (m *Manager) Start(_ context.Context) error {
 		return fmt.Errorf("create user data dir: %w", err)
 	}
 
+	m.mu.Lock()
+	checker := m.checker
+	m.mu.Unlock()
+
+	// 1. Run preflight validation to detect missing driver or browser before starting Playwright
+	if checker != nil {
+		if _, err := checker.Check(); err != nil {
+			return err
+		}
+	}
+
 	m.log.Info("starting playwright")
 	playwright, err := pw.Run()
 	if err != nil {
-		return fmt.Errorf("run playwright: %w", err)
+		return formatStartupError("run playwright", RequiredDriverVersion(), err)
 	}
 
 	absDir, err := filepath.Abs(m.userDataDir)
 	if err != nil {
+		_ = playwright.Stop()
 		return fmt.Errorf("resolve user data dir: %w", err)
 	}
 
@@ -58,7 +79,7 @@ func (m *Manager) Start(_ context.Context) error {
 	)
 	if err != nil {
 		_ = playwright.Stop()
-		return fmt.Errorf("launch persistent context: %w", err)
+		return formatStartupError("launch persistent context", RequiredDriverVersion(), err)
 	}
 
 	m.mu.Lock()
