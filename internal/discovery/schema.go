@@ -269,6 +269,9 @@ func classifyField(path, typeName string) FieldClassification {
 	if isTimestampField(lower) {
 		return FieldClassTimestamp
 	}
+	if isCurrencyField(lower, typeName) {
+		return FieldClassCurrency
+	}
 	if isMonetaryField(lower, typeName) {
 		return FieldClassMonetary
 	}
@@ -316,9 +319,15 @@ func isIdentifierField(lower, typeName string) bool {
 	if strings.Contains(lower, "timeout") || strings.Contains(lower, "period") {
 		return false
 	}
-	idWords := []string{"id", "uuid", "guid", "key", "ref", "code", "number", "pan"}
+	idWords := []string{
+		"id", "uuid", "guid", "key", "ref", "code", "number", "pan",
+		"accountid", "cardid", "operationid", "transactionid", "paymentid",
+		"transferid", "agreementid", "contractid", "statementid", "docid",
+		"clientid", "customerid", "accountnumber", "cardnumber", "agreementnumber",
+	}
 	for _, w := range idWords {
-		if lower == w || strings.HasSuffix(lower, "id") || strings.HasSuffix(lower, "uuid") || strings.HasSuffix(lower, "number") {
+		if lower == w || strings.HasSuffix(lower, "id") || strings.HasSuffix(lower, "uuid") ||
+			strings.HasSuffix(lower, "number") || strings.HasSuffix(lower, "ref") {
 			return true
 		}
 	}
@@ -329,7 +338,11 @@ func isTimestampField(lower string) bool {
 	if strings.Contains(lower, "timeout") {
 		return false
 	}
-	tsWords := []string{"time", "date", "timestamp", "created", "updated", "posted", "executed", "processed", "authorized", "booking"}
+	tsWords := []string{
+		"time", "date", "timestamp", "created", "updated", "posted",
+		"executed", "processed", "authorized", "booking", "operationtime",
+		"operationdate", "transactiondate", "periodstart", "periodend",
+	}
 	for _, w := range tsWords {
 		if strings.Contains(lower, w) {
 			return true
@@ -338,11 +351,23 @@ func isTimestampField(lower string) bool {
 	return false
 }
 
+func isCurrencyField(lower, typeName string) bool {
+	if typeName != "string" && typeName != "number" {
+		return false
+	}
+	return lower == "currency" || lower == "currencycode" || lower == "cur" || lower == "iso" ||
+		strings.HasSuffix(lower, "currency") || strings.HasSuffix(lower, "currencycode")
+}
+
 func isMonetaryField(lower, typeName string) bool {
 	if typeName != "number" && typeName != "string" {
 		return false
 	}
-	monWords := []string{"amount", "sum", "total", "balance", "credit", "debit", "fee", "charge", "price", "commission"}
+	monWords := []string{
+		"amount", "sum", "total", "balance", "credit", "debit", "fee",
+		"charge", "price", "commission", "turnover", "availablebalance",
+		"currentbalance", "totalbalance", "cashback", "bonus", "holdamount",
+	}
 	for _, w := range monWords {
 		if strings.Contains(lower, w) {
 			return true
@@ -366,7 +391,9 @@ func isMCCField(lower, typeName string) bool {
 }
 
 func isMerchantField(lower string) bool {
-	merchantWords := []string{"merchant", "shop", "store", "vendor", "payee", "counterparty"}
+	merchantWords := []string{
+		"merchant", "shop", "store", "vendor", "payee", "counterparty", "brand", "merchantname",
+	}
 	for _, w := range merchantWords {
 		if strings.Contains(lower, w) {
 			return true

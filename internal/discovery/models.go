@@ -61,11 +61,61 @@ const (
 	FieldClassIdentifier FieldClassification = "identifier"
 	FieldClassTimestamp  FieldClassification = "timestamp"
 	FieldClassMonetary   FieldClassification = "monetary_candidate"
+	FieldClassCurrency   FieldClassification = "currency_candidate"
 	FieldClassStatus     FieldClassification = "status_candidate"
 	FieldClassMCC        FieldClassification = "mcc_candidate"
 	FieldClassMerchant   FieldClassification = "merchant_candidate"
 	FieldClassCollection FieldClassification = "collection"
 )
+
+// RejectionReason specifies why a response was rejected or dropped in the capture pipeline.
+type RejectionReason string
+
+const (
+	ReasonHandlerInactive         RejectionReason = "handler_inactive"
+	ReasonNoActiveSession         RejectionReason = "no_active_session"
+	ReasonMalformedURL            RejectionReason = "malformed_url"
+	ReasonNonAllowedDomain        RejectionReason = "non_allowed_domain"
+	ReasonExcludedAuthPath        RejectionReason = "excluded_auth_path"
+	ReasonUnsupportedResourceType RejectionReason = "unsupported_resource_type"
+	ReasonUnsupportedContentType  RejectionReason = "unsupported_content_type"
+	ReasonCredentialDetected      RejectionReason = "credential_detected"
+	ReasonBodyTooLarge            RejectionReason = "body_too_large"
+	ReasonBodyReadError           RejectionReason = "body_read_error"
+	ReasonQueueFull               RejectionReason = "queue_full"
+	ReasonSuccessfullyEnqueued    RejectionReason = "successfully_enqueued"
+	ReasonSuccessfullyProcessed   RejectionReason = "successfully_processed"
+	ReasonProcessingFailed        RejectionReason = "processing_failed"
+)
+
+// HostnameStats maintains safe aggregate telemetry for an observed hostname.
+// Query parameters, credentials, and sensitive headers are never stored.
+type HostnameStats struct {
+	Hostname     string         `json:"hostname"`
+	TotalCount   int            `json:"total_count"`
+	Allowed      bool           `json:"allowed"`
+	ResourceDist map[string]int `json:"resource_dist"`
+	ContentDist  map[string]int `json:"content_dist"`
+	StatusDist   map[int]int    `json:"status_dist"`
+}
+
+// DiagnosticsSnapshot provides thread-safe runtime telemetry for status reporting.
+type DiagnosticsSnapshot struct {
+	TotalObserved       int                     `json:"total_observed"`
+	UniqueHostnames     int                     `json:"unique_hostnames"`
+	Hostnames           []HostnameStats         `json:"hostnames"`
+	ResourceDist        map[string]int          `json:"resource_dist"`
+	ContentDist         map[string]int          `json:"content_dist"`
+	StatusDist          map[int]int             `json:"status_dist"`
+	Rejections          map[RejectionReason]int `json:"rejections"`
+	Eligible            int                     `json:"eligible"`
+	Enqueued            int                     `json:"enqueued"`
+	QueueOverflow       int                     `json:"queue_overflow"`
+	Processed           int                     `json:"processed"`
+	ProcessingFailed    int                     `json:"processing_failed"`
+	UniqueFingerprints  int                     `json:"unique_fingerprints"`
+	HasEligibleEnqueued bool                    `json:"has_eligible_enqueued"`
+}
 
 // FieldSchema describes the structure of a single JSON field across observations.
 type FieldSchema struct {
@@ -104,6 +154,7 @@ type EndpointFingerprint struct {
 	HasDateParams   bool           `json:"has_date_params"`
 	ReturnsList     bool           `json:"returns_list"`
 	Classification  Classification `json:"classification"`
+	Sanitized       bool           `json:"sanitized,omitempty"`
 	CaptureWarnings []string       `json:"capture_warnings,omitempty"`
 }
 
@@ -117,16 +168,18 @@ type Classification struct {
 
 // CaptureJob is a unit of work for the capture worker.
 type CaptureJob struct {
-	SessionID    SessionID
-	Method       string
-	URL          string
-	Status       int
-	ContentType  string
-	ResourceType string
-	Body         []byte // nil if metadata-only
-	BodySize     int64
-	BodyError    string // set if body retrieval failed
-	HasDateParam bool
+	SessionID       SessionID
+	Method          string
+	URL             string
+	Status          int
+	ContentType     string
+	ResourceType    string
+	Body            []byte // nil if metadata-only
+	BodySize        int64
+	BodyError       string // set if body retrieval failed
+	HasDateParam    bool
+	Sanitized       bool     // true if credentials were stripped from body
+	SanitizedFields []string // names of sanitized sensitive fields (no values)
 
 	// Barrier coordination
 	IsBarrier   bool

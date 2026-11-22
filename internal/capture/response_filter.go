@@ -3,9 +3,14 @@ package capture
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log/slog"
 	"net/url"
+	"path"
 	"strings"
+
+	"github.com/khaliullov/tbank-capture/internal/discovery"
 )
 
 // Filter decides whether a network response is eligible for capture.
@@ -16,24 +21,61 @@ type Filter struct {
 }
 
 // NewFilter creates a Filter.
-// allowedDomains: list of domains (e.g. "tbank.ru") to accept.
+// allowedDomains: list of domains (e.g. "tbank.ru", "tinkoff.ru") to accept.
 func NewFilter(log *slog.Logger, maxBodySize int64, allowedDomains []string) *Filter {
-	return &Filter{log: log, maxBodySize: maxBodySize, allowedDomains: allowedDomains}
+	normalized := make([]string, 0, len(allowedDomains))
+	for _, d := range allowedDomains {
+		norm := strings.ToLower(strings.TrimSpace(d))
+		norm = strings.TrimSuffix(norm, ".")
+		if norm != "" {
+			normalized = append(normalized, norm)
+		}
+	}
+	return &Filter{log: log, maxBodySize: maxBodySize, allowedDomains: normalized}
 }
 
-// EligibleURL returns true if the URL belongs to an allowed domain.
-func (f *Filter) EligibleURL(rawURL string) bool {
+// ExtractHostname parses a URL and returns its normalized lowercase hostname without port or trailing dot.
+func ExtractHostname(rawURL string) (string, error) {
 	u, err := url.Parse(rawURL)
+	if err != nil {
+		return "", fmt.Errorf("malformed url: %w", err)
+	}
+	h := strings.ToLower(strings.TrimSpace(u.Hostname()))
+	h = strings.TrimSuffix(h, ".")
+	if h == "" {
+		return "", errors.New("empty hostname")
+	}
+	return h, nil
+}
+
+// EligibleURL returns true if the URL belongs to an allowed domain or its subdomains.
+// It prevents lookalike domains (e.g. evil-tbank.ru, tbank.ru.attacker.com).
+func (f *Filter) EligibleURL(rawURL string) bool {
+	host, err := ExtractHostname(rawURL)
 	if err != nil {
 		return false
 	}
-	host := strings.ToLower(u.Hostname())
+	return f.IsAllowedHost(host)
+}
+
+// IsAllowedHost checks whether a normalized hostname matches any configured allowed domain or subdomain.
+func (f *Filter) IsAllowedHost(host string) bool {
+	if host == "" {
+		return false
+	}
 	for _, domain := range f.allowedDomains {
 		if host == domain || strings.HasSuffix(host, "."+domain) {
 			return true
 		}
 	}
 	return false
+}
+
+// AllowedDomains returns a copy of the allowed domains list.
+func (f *Filter) AllowedDomains() []string {
+	cp := make([]string, len(f.allowedDomains))
+	copy(cp, f.allowedDomains)
+	return cp
 }
 
 // EligibleResourceType returns true for XHR and Fetch resource types.
@@ -47,7 +89,7 @@ func (f *Filter) EligibleResourceType(rt string) bool {
 
 // EligibleContentType returns true for JSON content types.
 func (f *Filter) EligibleContentType(ct string) bool {
-	ct = strings.ToLower(ct)
+	ct = strings.ToLower(strings.TrimSpace(ct))
 	return strings.Contains(ct, "application/json") || strings.Contains(ct, "+json")
 }
 
@@ -60,35 +102,80 @@ func (f *Filter) EligibleBodySize(size int64) bool {
 	return size <= f.maxBodySize
 }
 
-// authPathKeywords lists URL path segments or prefixes indicating auth, login, or session management.
-var authPathKeywords = []string{
-	"/authorize",
-	"/login",
-	"/logout",
-	"/token",
-	"/session",
-	"/auth",
-	"/sign",
-	"/oauth",
-	"/oidc",
-	"/sso",
-	"/passport",
-	"/security",
+// CheckEligiblePath evaluates whether a URL path should be excluded as an authentication or credential endpoint.
+// It returns true if eligible (not excluded), or false with ReasonExcludedAuthPath.
+func (f *Filter) CheckEligiblePath(rawURL string) (bool, discovery.RejectionReason) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false, discovery.ReasonMalformedURL
+	}
+	clean := path.Clean("/" + u.Path)
+	parts := strings.Split(strings.Trim(clean, "/"), "/")
+	if len(parts) == 0 || (len(parts) == 1 && parts[0] == "") {
+		return true, ""
+	}
+
+	for i, part := range parts {
+		seg := strings.ToLower(strings.TrimSpace(part))
+		// Standalone auth actions
+		switch seg {
+		case "login", "signin", "sign-in", "logout", "signout", "sign-out", "saml", "sso", "webauthn", "2fa", "mfa":
+			return false, discovery.ReasonExcludedAuthPath
+		case "oauth", "oidc", "passport":
+			// If subsequent segment is token, authorize, login, auth, sms, otp, code, callback
+			if i+1 < len(parts) {
+				next := strings.ToLower(strings.TrimSpace(parts[i+1]))
+				switch next {
+				case "token", "authorize", "login", "auth", "sms", "otp", "code", "callback":
+					return false, discovery.ReasonExcludedAuthPath
+				}
+			}
+			// Standalone /oauth or /passport or /oidc
+			if i == len(parts)-1 {
+				return false, discovery.ReasonExcludedAuthPath
+			}
+		case "auth":
+			// If subsequent segment is login, token, refresh, otp, sms, verify, confirm
+			if i+1 < len(parts) {
+				next := strings.ToLower(strings.TrimSpace(parts[i+1]))
+				switch next {
+				case "login", "token", "refresh", "otp", "sms", "verify", "confirm", "code":
+					return false, discovery.ReasonExcludedAuthPath
+				}
+			} else {
+				// /auth as terminal endpoint
+				return false, discovery.ReasonExcludedAuthPath
+			}
+		case "session":
+			// /session alone is often session creation/login check
+			// BUT /session/accounts, /session/user, /session/products, /session/cards, etc. are business endpoints!
+			if i == len(parts)-1 {
+				return false, discovery.ReasonExcludedAuthPath
+			}
+			next := strings.ToLower(strings.TrimSpace(parts[i+1]))
+			switch next {
+			case "login", "logout", "authenticate", "auth", "confirm", "create", "start":
+				return false, discovery.ReasonExcludedAuthPath
+			}
+		case "authorize":
+			// Single authorize segment (e.g. OAuth authorize)
+			// Note: "authorizations" (plural) is NOT matched here!
+			return false, discovery.ReasonExcludedAuthPath
+		case "token":
+			// If segment is "token" at the end (e.g. /api/token, /v1/token)
+			if i == len(parts)-1 {
+				return false, discovery.ReasonExcludedAuthPath
+			}
+		}
+	}
+
+	return true, ""
 }
 
 // EligiblePath returns true if the URL path is not an authentication, session, or token endpoint.
 func (f *Filter) EligiblePath(rawURL string) bool {
-	u, err := url.Parse(rawURL)
-	if err != nil {
-		return false
-	}
-	path := strings.ToLower(u.Path)
-	for _, kw := range authPathKeywords {
-		if strings.HasPrefix(path, kw) || strings.Contains(path, kw+"/") || strings.HasSuffix(path, kw) {
-			return false
-		}
-	}
-	return true
+	ok, _ := f.CheckEligiblePath(rawURL)
+	return ok
 }
 
 // sensitiveNormalizedExact matches normalized field names that indicate authentication secrets.
@@ -130,11 +217,6 @@ var sensitiveNormalizedExact = map[string]bool{
 }
 
 // normalizeFieldName removes separators and lowercases a key name.
-// Examples:
-// - "access_token" -> "accesstoken"
-// - "accessToken"  -> "accesstoken"
-// - "CSRF-Token"   -> "csrftoken"
-// - "one_time_password" -> "onetimepassword"
 func normalizeFieldName(key string) string {
 	var sb strings.Builder
 	sb.Grow(len(key))
@@ -154,8 +236,15 @@ func isSensitiveField(norm string) bool {
 	if sensitiveNormalizedExact[norm] {
 		return true
 	}
-	// Check suffix/prefix patterns while avoiding false positives on pagination or normal fields.
-	if strings.HasSuffix(norm, "token") && !strings.Contains(norm, "page") && !strings.Contains(norm, "cursor") {
+	// Check suffix/prefix patterns while avoiding false positives on business/pagination fields.
+	if strings.HasSuffix(norm, "token") {
+		if strings.Contains(norm, "page") || strings.Contains(norm, "cursor") ||
+			strings.Contains(norm, "scroll") || strings.Contains(norm, "sync") ||
+			strings.Contains(norm, "delta") || strings.Contains(norm, "operation") ||
+			strings.Contains(norm, "transaction") || strings.Contains(norm, "payment") ||
+			strings.Contains(norm, "order") {
+			return false
+		}
 		return true
 	}
 	if strings.HasSuffix(norm, "secret") {
@@ -179,64 +268,115 @@ func isSensitiveField(norm string) bool {
 	return false
 }
 
-// ContainsAuthSecret performs a conservative recursive JSON inspection that detects
-// sensitive authentication and credential field names independently of capitalization
-// and common naming conventions (camelCase, snake_case, kebab-case).
-//
-// Limitations:
-//   - The detector inspects JSON keys and known credential value patterns; it cannot
-//     infer whether an opaque string in an arbitrary unmodeled property name is a secret.
-//   - Fails closed: if the body cannot be parsed as valid JSON, it returns true to avoid
-//     ingesting uninspected data.
-//   - Callers must never log rejected bodies or extract secret values.
-func ContainsAuthSecret(body []byte) bool {
+// SanitizeCredentials recursively inspects a JSON body, removes authentication and credential
+// fields and their values, and preserves all other schema and business data for analysis and storage.
+// It returns the sanitized body, whether any credential was removed, the names of sanitized fields,
+// and any parsing/nesting error.
+// Fails closed if the input is not valid JSON or nesting exceeds limits.
+func SanitizeCredentials(body []byte) (sanitizedBody []byte, wasSanitized bool, sanitizedFields []string, err error) {
 	if len(body) == 0 {
-		return false
+		return body, false, nil, nil
 	}
 
 	var root interface{}
 	if err := json.Unmarshal(body, &root); err != nil {
-		// Fail closed when JSON cannot be safely parsed and inspected.
-		return true
+		return nil, false, nil, fmt.Errorf("json unmarshal failed: %w", err)
 	}
 
-	return inspectJSONNode(root, 0)
+	fieldSet := make(map[string]bool)
+	cleanedRoot, wasSanitized, err := sanitizeNode(root, 0, fieldSet)
+	if err != nil {
+		return nil, false, nil, err
+	}
+
+	fields := make([]string, 0, len(fieldSet))
+	for f := range fieldSet {
+		fields = append(fields, f)
+	}
+
+	if wasSanitized {
+		out, err := json.Marshal(cleanedRoot)
+		if err != nil {
+			return nil, false, nil, fmt.Errorf("json marshal sanitized body failed: %w", err)
+		}
+		return out, true, fields, nil
+	}
+
+	return body, false, nil, nil
 }
 
-func inspectJSONNode(node interface{}, depth int) bool {
+func sanitizeNode(node interface{}, depth int, fieldSet map[string]bool) (interface{}, bool, error) {
 	if depth > 64 {
-		// Fail closed on pathological nesting.
-		return true
+		return nil, false, errors.New("maximum nesting depth exceeded (pathological nesting)")
 	}
 
+	var anySanitized bool
 	switch val := node.(type) {
 	case map[string]interface{}:
+		cleanedMap := make(map[string]interface{}, len(val))
 		for k, v := range val {
 			norm := normalizeFieldName(k)
 			if isSensitiveField(norm) {
-				return true
+				fieldSet[k] = true
+				anySanitized = true
+				// Exclude credential field and value entirely
+				continue
 			}
-			if inspectJSONNode(v, depth+1) {
-				return true
+			childCleaned, childSanitized, err := sanitizeNode(v, depth+1, fieldSet)
+			if err != nil {
+				return nil, false, err
 			}
+			if childSanitized {
+				anySanitized = true
+			}
+			cleanedMap[k] = childCleaned
 		}
+		return cleanedMap, anySanitized, nil
+
 	case []interface{}:
-		for _, elem := range val {
-			if inspectJSONNode(elem, depth+1) {
-				return true
+		cleanedArr := make([]interface{}, len(val))
+		for i, elem := range val {
+			childCleaned, childSanitized, err := sanitizeNode(elem, depth+1, fieldSet)
+			if err != nil {
+				return nil, false, err
 			}
+			if childSanitized {
+				anySanitized = true
+			}
+			cleanedArr[i] = childCleaned
 		}
+		return cleanedArr, anySanitized, nil
+
 	case string:
-		// Check for embedded PEM private keys or bearer tokens in string values.
+		// Check for embedded PEM private keys or bearer JWTs in string values
 		if strings.HasPrefix(val, "-----BEGIN") && strings.Contains(val, "PRIVATE KEY") {
-			return true
+			fieldSet["[embedded_private_key]"] = true
+			return "<redacted_secret>", true, nil
 		}
 		lower := strings.ToLower(val)
 		if strings.HasPrefix(lower, "bearer eyj") && len(val) > 20 {
-			return true
+			fieldSet["[bearer_jwt]"] = true
+			return "<redacted_secret>", true, nil
 		}
+		return val, false, nil
+
+	default:
+		return val, false, nil
 	}
-	return false
+}
+
+// ContainsAuthSecret performs a conservative recursive JSON inspection that detects
+// sensitive authentication and credential field names.
+// Fails closed on invalid JSON.
+func ContainsAuthSecret(body []byte) bool {
+	if len(body) == 0 {
+		return false
+	}
+	_, wasSanitized, _, err := SanitizeCredentials(body)
+	if err != nil {
+		return true
+	}
+	return wasSanitized
 }
 
 // NormalizedURL returns the scheme + host + path only, discarding query, userinfo, and fragment.

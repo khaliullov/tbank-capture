@@ -5,3 +5,5 @@ data/discovery/sessions/
 data/discovery/reports/
 /tbank-capture
 *.tmp
+.env
+.env.local

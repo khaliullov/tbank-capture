@@ -112,6 +112,7 @@ All configuration is provided via environment variables. Malformed or invalid ex
 | `USER_DATA_DIR` | `./data/browser-profile` | Path | Persistent Chromium profile directory |
 | `RAW_CAPTURE_DIR` | `./data/raw` | Path | Directory for raw response files |
 | `DISCOVERY_DIR` | `./data/discovery` | Path | Root directory for sessions and reports |
+| `CAPTURE_ALLOWED_DOMAINS` | `tbank.ru,tinkoff.ru` | String | Comma-separated allowed domain roots for API discovery |
 | `HEADLESS` | `false` | Boolean | Run browser headless (keep false for manual login) |
 | `DISCOVERY_RAW_CAPTURE` | `false` | Boolean | Store raw response bodies to disk (sensitive!) |
 | `MAX_RESPONSE_BODY_BYTES` | `10485760` (10 MB) | Integer | Max response body size to inspect |
@@ -130,6 +131,7 @@ TELEGRAM_CHAT_ID=987654321
 USER_DATA_DIR=./data/browser-profile
 RAW_CAPTURE_DIR=./data/raw
 DISCOVERY_DIR=./data/discovery
+CAPTURE_ALLOWED_DOMAINS=tbank.ru,tinkoff.ru
 
 HEADLESS=false
 DISCOVERY_RAW_CAPTURE=false
@@ -250,6 +252,14 @@ make build
 
 ### Step 1: Start the application
 
+Настройте переменные окружения через `.env`:
+```bash
+cp .env.example .env
+# Отредактируйте .env и укажите TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID
+make run
+```
+
+Или экспортируйте переменные вручную:
 ```bash
 export TELEGRAM_BOT_TOKEN="your_token"
 export TELEGRAM_CHAT_ID="your_chat_id"
@@ -310,7 +320,8 @@ The bot accepts commands exclusively in a **private chat** from the single confi
 | Command | Description |
 |---|---|
 | `/start` | Bot overview and security notice |
-| `/status` | Current browser state, active session, and live counters |
+| `/status` | Pipeline health status, browser state, active session, and actionable warnings |
+| `/diagnostics` | Detailed diagnostic snapshot: observed hostnames, rejection reasons, resource types, and queue metrics |
 | `/discovery_start` | Starts a new discovery session |
 | `/discovery_stop` | Finalizes current session and generates discovery reports |
 | `/report` | Returns the filename of the latest generated report |
@@ -368,7 +379,10 @@ Reports are written to `./data/discovery/reports/` with restrictive permissions 
 
 - **Structurally Scoped Classification**: Transaction evidence is strictly evaluated within the *same* repeated record structure (e.g. array items `$.items[]`). Fields from unrelated JSON branches (such as account metadata co-located with unrelated items) cannot falsely synthesize a transaction history classification. Generic commission and amount/status fields alone do not imply payment or transfer endpoints without domain signals.
 - **Content-Length Pre-Check**: Checks HTTP `Content-Length` header before reading body data. Payloads exceeding `MAX_RESPONSE_BODY_BYTES` are rejected prior to body allocation.
-- **Recursive Secret Detection**: Analyzes JSON structure for authentication secrets (`access_token`, `refresh_token`, `id_token`, `authorization`, `bearer`, `password`, `otp`, `one_time_password`, `client_secret`, `session_token`, `csrf_token`, `private_key`, etc.) across camelCase, snake_case, and kebab-case. Any response containing secrets is immediately discarded.
+- **Recursive Credential Sanitization**: Analyzes JSON structure for authentication secrets (`access_token`, `refresh_token`, `id_token`, `authorization`, `bearer`, `password`, `otp`, `one_time_password`, `client_secret`, `session_token`, `csrf_token`, `private_key`, etc.) across camelCase, snake_case, and kebab-case. Rather than rejecting entire financial payloads containing unrelated tokens, true credentials are safely removed while business identifiers (`operationToken`, `pageToken`) and financial schemas are preserved for analysis. Sanitized responses never contain secret values, and raw storage only persists sanitized data.
+- **Passive Hostname Telemetry**: Observes all network traffic passing through Chromium without reading response bodies of unknown hostnames. Safely aggregates total responses, resource types, and content types so legitimate first-party domains (e.g. `*.tinkoff.ru`) can be identified and added to `CAPTURE_ALLOWED_DOMAINS`.
+- **Structured Rejection Tracking**: Every filtered response is assigned a terminal rejection reason (`non_allowed_domain`, `excluded_auth_path`, `unsupported_content_type`, `unsupported_resource_type`, `body_too_large`, etc.) to provide transparency into pipeline behavior.
+- **Precise Path Segment Filtering**: Path exclusions use strict segment matching to reject login and token generation endpoints while preserving legitimate business endpoints (e.g. `/api/v1/session/accounts`).
 - **Fail-Closed on Unparsable Data**: Bodies that cannot be parsed as valid JSON fail closed and are discarded.
 - **Dynamic Path Normalization**: Dynamic UUIDs, numeric IDs, prefixed IDs (`acc_12345`, `op_98765`), and hashes are collapsed to `{id}` to ensure fingerprint stability.
 - **Query Parameter Striping**: Query parameters are never stored in reports or fingerprints; date-range parameter presence is detected case-insensitively without retaining values.

@@ -28,6 +28,7 @@ type Config struct {
 	RawCaptureEnabled   bool
 	MaxResponseBodySize int64
 	CaptureQueueSize    int
+	AllowedDomains      []string
 
 	// JSON analysis limits
 	MaxJSONDepth  int
@@ -39,8 +40,11 @@ type Config struct {
 }
 
 // Load reads configuration from environment variables and validates all fields.
+// If a .env file exists in the current directory, it is loaded first.
 // Secrets such as TELEGRAM_BOT_TOKEN are never included in error messages.
 func Load() (*Config, error) {
+	_ = LoadEnv(".env")
+
 	c := &Config{}
 	var err error
 
@@ -100,6 +104,9 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 
+	// Allowed domains for capture
+	c.AllowedDomains = parseAllowedDomains(envStr("CAPTURE_ALLOWED_DOMAINS", "tbank.ru,tinkoff.ru"))
+
 	// Logging
 	c.LogLevel = strings.ToLower(envStr("LOG_LEVEL", "info"))
 
@@ -134,6 +141,10 @@ func (c *Config) validate() error {
 	}
 	if c.MaxJSONFields <= 0 {
 		return errors.New("MAX_JSON_FIELDS must be positive")
+	}
+
+	if len(c.AllowedDomains) == 0 {
+		return errors.New("CAPTURE_ALLOWED_DOMAINS must contain at least one valid domain")
 	}
 
 	validLevels := map[string]bool{"debug": true, "info": true, "warn": true, "error": true}
@@ -193,4 +204,19 @@ func envInt64(key string, def int64) (int64, error) {
 		return 0, fmt.Errorf("invalid integer value for %s: %q", key, trimmed)
 	}
 	return n, nil
+}
+
+func parseAllowedDomains(raw string) []string {
+	parts := strings.Split(raw, ",")
+	seen := make(map[string]bool, len(parts))
+	var out []string
+	for _, p := range parts {
+		d := strings.ToLower(strings.TrimSpace(p))
+		d = strings.TrimSuffix(d, ".")
+		if d != "" && !seen[d] {
+			seen[d] = true
+			out = append(out, d)
+		}
+	}
+	return out
 }

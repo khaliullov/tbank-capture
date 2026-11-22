@@ -1,7 +1,6 @@
 package capture
 
 import (
-	"fmt"
 	"log/slog"
 	"strconv"
 	"strings"
@@ -45,6 +44,7 @@ type ResponseHandler struct {
 
 	mu     sync.RWMutex
 	active bool
+	wg     sync.WaitGroup
 
 	// Metrics counters
 	countObserved  atomic.Int64
@@ -113,101 +113,137 @@ func (h *ResponseHandler) Deactivate() {
 }
 
 // Attach registers OnResponse on the given Playwright page.
+// The callback is dispatched in a separate goroutine so that synchronous Playwright RPCs
+// (e.g. resp.Body()) do not block Playwright's single-threaded connection dispatch loop.
 func (h *ResponseHandler) Attach(page pw.Page) {
 	page.OnResponse(func(resp pw.Response) {
-		h.HandleResponse(resp)
+		h.wg.Add(1)
+		go func() {
+			defer h.wg.Done()
+			h.HandleResponse(resp)
+		}()
 	})
 }
 
 // AttachContext registers OnResponse on the entire browser context to observe all pages.
+// The callback is dispatched in a separate goroutine to avoid connection dispatch deadlocks.
 func (h *ResponseHandler) AttachContext(bctx pw.BrowserContext) {
 	bctx.OnResponse(func(resp pw.Response) {
-		h.HandleResponse(resp)
+		h.wg.Add(1)
+		go func() {
+			defer h.wg.Done()
+			h.HandleResponse(resp)
+		}()
 	})
 }
 
-// HandleResponse processes a network response event synchronously.
+// Wait blocks until all in-flight response handling goroutines have completed.
+func (h *ResponseHandler) Wait() {
+	h.wg.Wait()
+}
+
+// HandleResponse processes a network response event with structured diagnostic tracking.
 func (h *ResponseHandler) HandleResponse(resp pw.Response) {
+	// Snapshot handler state under a brief read lock to avoid holding locks during Playwright RPCs.
 	h.mu.RLock()
-	defer h.mu.RUnlock()
-
-	if !h.active {
-		h.countFiltered.Add(1)
-		return
-	}
-
-	h.countObserved.Add(1)
-	if h.collector != nil {
-		h.collector.IncrObserved()
-	}
-
+	active := h.active
 	sessID := h.activeSessionID
 	if sessID == "" && h.sessionID != nil {
 		sessID = h.sessionID()
 	}
-	if sessID == "" {
-		h.countFiltered.Add(1)
-		if h.collector != nil {
-			h.collector.IncrFiltered()
-		}
-		return
-	}
+	filter := h.filter
+	submitter := h.submitter
+	collector := h.collector
+	maxBody := h.maxBody
+	h.mu.RUnlock()
 
 	rawURL := resp.URL()
-
-	// 1. Domain filter
-	if !h.filter.EligibleURL(rawURL) {
-		h.countFiltered.Add(1)
-		if h.collector != nil {
-			h.collector.IncrFiltered()
-		}
-		return
-	}
-
-	// 2. Auth path filter
-	if !h.filter.EligiblePath(rawURL) {
-		h.countFiltered.Add(1)
-		if h.collector != nil {
-			h.collector.IncrFiltered()
-		}
-		h.log.Debug("excluded auth path", "url", NormalizedURL(rawURL))
-		return
-	}
-
-	// 3. Resource type filter
 	req := resp.Request()
 	resourceType := strings.ToLower(strings.TrimSpace(req.ResourceType()))
-	if !h.filter.EligibleResourceType(resourceType) {
-		h.countFiltered.Add(1)
-		if h.collector != nil {
-			h.collector.IncrFiltered()
-		}
-		return
-	}
-
-	// 4. Content-Type filter
 	headers := resp.Headers()
 	contentType := headers["content-type"]
-	if !h.filter.EligibleContentType(contentType) {
+	status := resp.Status()
+
+	// Extract normalized hostname for passive telemetry
+	host, hostErr := ExtractHostname(rawURL)
+	isAllowed := false
+	if hostErr == nil && filter != nil {
+		isAllowed = filter.IsAllowedHost(host)
+	}
+
+	// Unconditionally observe every response and record aggregate metadata
+	h.countObserved.Add(1)
+	if collector != nil {
+		collector.RecordObservation(host, isAllowed, resourceType, contentType, status)
+	}
+
+	// 1. Check handler active state
+	if !active {
 		h.countFiltered.Add(1)
-		if h.collector != nil {
-			h.collector.IncrFiltered()
+		if collector != nil {
+			collector.RecordRejection(discovery.ReasonHandlerInactive)
 		}
 		return
 	}
 
-	// Base capture job with URL and response metadata (safe for metadata-only discovery)
-	job := discovery.CaptureJob{
-		SessionID:    sessID,
-		Method:       req.Method(),
-		URL:          rawURL,
-		Status:       resp.Status(),
-		ContentType:  contentType,
-		ResourceType: resourceType,
-		HasDateParam: discovery.QueryHasDateParams(RawQueryString(rawURL)),
+	// 2. Check active session
+	if sessID == "" {
+		h.countFiltered.Add(1)
+		if collector != nil {
+			collector.RecordRejection(discovery.ReasonNoActiveSession)
+		}
+		return
 	}
 
-	// 5. Pre-read size limit check via Content-Length header to avoid expensive allocation
+	// 3. URL validity check
+	if hostErr != nil {
+		h.countFiltered.Add(1)
+		if collector != nil {
+			collector.RecordRejection(discovery.ReasonMalformedURL)
+		}
+		return
+	}
+
+	// 4. Domain filter check
+	if !isAllowed {
+		h.countFiltered.Add(1)
+		if collector != nil {
+			collector.RecordRejection(discovery.ReasonNonAllowedDomain)
+		}
+		return
+	}
+
+	// 5. Excluded auth path check
+	if filter != nil {
+		if eligible, rej := filter.CheckEligiblePath(rawURL); !eligible {
+			h.countFiltered.Add(1)
+			if collector != nil {
+				collector.RecordRejection(rej)
+			}
+			h.log.Debug("excluded auth path", "url", NormalizedURL(rawURL), "reason", rej)
+			return
+		}
+	}
+
+	// 6. Resource type filter check
+	if filter != nil && !filter.EligibleResourceType(resourceType) {
+		h.countFiltered.Add(1)
+		if collector != nil {
+			collector.RecordRejection(discovery.ReasonUnsupportedResourceType)
+		}
+		return
+	}
+
+	// 7. Content-Type filter check
+	if filter != nil && !filter.EligibleContentType(contentType) {
+		h.countFiltered.Add(1)
+		if collector != nil {
+			collector.RecordRejection(discovery.ReasonUnsupportedContentType)
+		}
+		return
+	}
+
+	// 8. Pre-read size limit check via Content-Length header
 	var clDeclared int64 = -1
 	if clStr, ok := headers["content-length"]; ok {
 		if n, err := strconv.ParseInt(strings.TrimSpace(clStr), 10, 64); err == nil && n >= 0 {
@@ -215,57 +251,79 @@ func (h *ResponseHandler) HandleResponse(resp pw.Response) {
 		}
 	}
 
-	if clDeclared > h.maxBody {
-		job.BodyError = fmt.Sprintf("Content-Length %d exceeds max allowed %d bytes", clDeclared, h.maxBody)
-		job.BodySize = clDeclared
+	if clDeclared > maxBody {
+		h.countFiltered.Add(1)
+		if collector != nil {
+			collector.RecordRejection(discovery.ReasonBodyTooLarge)
+		}
 		h.log.Debug("response rejected before reading: Content-Length exceeds limit",
 			"url", NormalizedURL(rawURL),
 			"contentLength", clDeclared,
-			"maxAllowed", h.maxBody)
-	} else {
-		// Read body synchronously within Playwright response callback
-		body, err := resp.Body()
-		if err != nil {
-			job.BodyError = fmt.Sprintf("body retrieval error: %v", err)
-			h.log.Debug("body read error", "url", NormalizedURL(rawURL), "err", err)
-		} else if int64(len(body)) > h.maxBody {
-			// Second safety check on actual received body size
-			job.BodyError = fmt.Sprintf("body size %d exceeds max allowed %d bytes", len(body), h.maxBody)
-			job.BodySize = int64(len(body))
-			h.log.Debug("body rejected after read: size exceeds limit",
-				"url", NormalizedURL(rawURL),
-				"size", len(body),
-				"maxAllowed", h.maxBody)
-		} else {
-			// Inspect for authentication secrets conservatively
-			if ContainsAuthSecret(body) {
-				h.countFiltered.Add(1)
-				if h.collector != nil {
-					h.collector.IncrFiltered()
-				}
-				h.log.Debug("excluded: auth secret detected in response body", "url", NormalizedURL(rawURL))
-				return
-			}
-			job.Body = body
-			job.BodySize = int64(len(body))
+			"maxAllowed", maxBody)
+		return
+	}
+
+	// 9. Read body without holding mutex locks
+	body, err := resp.Body()
+	if err != nil {
+		h.countFiltered.Add(1)
+		if collector != nil {
+			collector.RecordRejection(discovery.ReasonBodyReadError)
 		}
+		h.log.Debug("body read error", "url", NormalizedURL(rawURL), "err", err)
+		return
 	}
 
+	if int64(len(body)) > maxBody {
+		h.countFiltered.Add(1)
+		if collector != nil {
+			collector.RecordRejection(discovery.ReasonBodyTooLarge)
+		}
+		h.log.Debug("body rejected after read: size exceeds limit",
+			"url", NormalizedURL(rawURL),
+			"size", len(body),
+			"maxAllowed", maxBody)
+		return
+	}
+
+	// 10. Credential detection & safe structural sanitization
+	sanitizedBody, wasSanitized, sanFields, sanErr := SanitizeCredentials(body)
+	if sanErr != nil {
+		// Fails closed on malformed JSON or pathological nesting
+		h.countFiltered.Add(1)
+		if collector != nil {
+			collector.RecordRejection(discovery.ReasonCredentialDetected)
+		}
+		h.log.Debug("body rejected: malformed JSON or credential inspection failure", "url", NormalizedURL(rawURL), "err", sanErr)
+		return
+	}
+
+	// 11. Build safe capture job
+	job := discovery.CaptureJob{
+		SessionID:       sessID,
+		Method:          req.Method(),
+		URL:             rawURL,
+		Status:          status,
+		ContentType:     contentType,
+		ResourceType:    resourceType,
+		Body:            sanitizedBody,
+		BodySize:        int64(len(sanitizedBody)),
+		HasDateParam:    discovery.QueryHasDateParams(RawQueryString(rawURL)),
+		Sanitized:       wasSanitized,
+		SanitizedFields: sanFields,
+	}
+
+	// 12. Submit job to queue
 	h.countEligible.Add(1)
-	if h.collector != nil {
-		h.collector.IncrEligible()
-	}
-
-	// Enqueue job via submitter
-	if h.submitter != nil {
-		if h.submitter.Submit(job) {
-			if h.collector != nil {
-				h.collector.IncrEnqueued()
+	if submitter != nil {
+		if submitter.Submit(job) {
+			if collector != nil {
+				collector.RecordEnqueued()
 			}
 		} else {
 			h.countQueueFull.Add(1)
-			if h.collector != nil {
-				h.collector.IncrQueueOverflow()
+			if collector != nil {
+				collector.RecordQueueOverflow()
 			}
 			h.log.Warn("capture queue full or closed, dropping response",
 				"url", NormalizedURL(rawURL),

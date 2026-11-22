@@ -123,6 +123,7 @@ type recordScope struct {
 	hasID            bool
 	hasTimestamp     bool
 	hasAmount        bool
+	hasCurrency      bool
 	hasStatus        bool
 	hasMCC           bool
 	hasMerchant      bool
@@ -184,6 +185,8 @@ func analyzeSchemaFacts(fp *EndpointFingerprint) schemaFacts {
 			scope.hasTimestamp = true
 		case FieldClassMonetary:
 			scope.hasAmount = true
+		case FieldClassCurrency:
+			scope.hasCurrency = true
 		case FieldClassStatus:
 			scope.hasStatus = true
 		case FieldClassMCC:
@@ -250,17 +253,38 @@ func (c *Classifier) evaluateTransactions(normPath string, segments []string, fp
 		}
 	}
 
+	if matchingScope == nil && pathHasTx {
+		// Structurally scoped check for individual transaction detail (top-level non-collection object)
+		topScope := f.scopes[""]
+		if topScope != nil && topScope.hasID && topScope.hasTimestamp && topScope.hasAmount {
+			if !topScope.hasAccountFields && !topScope.hasCardFields {
+				matchingScope = topScope
+				cand.reasons = append(cand.reasons, "response contains transaction detail record with identifier, timestamp, and monetary amount")
+			}
+		}
+	}
+
 	if matchingScope != nil {
 		cand.score += 0.35
 		cand.independentSignals++
 		cand.hasDomainSchema = true
-		cand.reasons = append(cand.reasons, "response contains repeated record structure with identifier, timestamp, and monetary amount")
+		if len(cand.reasons) == 0 {
+			cand.reasons = append(cand.reasons, "response contains repeated record structure with identifier, timestamp, and monetary amount")
+		}
 
 		// Merchant and MCC must be associated with the same record structure
 		if matchingScope.hasMerchant || matchingScope.hasMCC {
 			cand.score += 0.20
 			cand.independentSignals++
 			cand.reasons = append(cand.reasons, "transaction record structure includes merchant or MCC categorization fields")
+		}
+		if matchingScope.hasCurrency {
+			cand.score += 0.05
+			cand.reasons = append(cand.reasons, "transaction record structure includes currency code")
+		}
+		if matchingScope.hasStatus {
+			cand.score += 0.05
+			cand.reasons = append(cand.reasons, "transaction record structure includes operation status")
 		}
 	}
 

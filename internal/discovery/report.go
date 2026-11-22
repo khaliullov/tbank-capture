@@ -21,6 +21,8 @@ type Report struct {
 	StartedAt   time.Time             `json:"started_at"`
 	FinishedAt  time.Time             `json:"finished_at"`
 	Summary     ReportSummary         `json:"summary"`
+	Hostnames   []HostnameStats       `json:"hostnames,omitempty"`
+	Rejections  map[string]int        `json:"rejections,omitempty"`
 	Candidates  []EndpointFingerprint `json:"candidates"`
 	Unknown     []EndpointFingerprint `json:"unknown"`
 	Warnings    []string              `json:"warnings,omitempty"`
@@ -65,6 +67,11 @@ func NewGenerator(reportDir string) *Generator {
 // Generate writes both Markdown and JSON reports, returning their file paths.
 // All files are created with restrictive 0600 permissions.
 func (g *Generator) Generate(sess *Session, fps []*EndpointFingerprint, metrics Metrics) (mdPath, jsonPath string, err error) {
+	return g.GenerateWithDiagnostics(sess, fps, metrics, DiagnosticsSnapshot{})
+}
+
+// GenerateWithDiagnostics writes reports including comprehensive hostname inventory and rejection diagnostics.
+func (g *Generator) GenerateWithDiagnostics(sess *Session, fps []*EndpointFingerprint, metrics Metrics, diag DiagnosticsSnapshot) (mdPath, jsonPath string, err error) {
 	if sess == nil {
 		return "", "", fmt.Errorf("cannot generate report: session is nil")
 	}
@@ -78,7 +85,7 @@ func (g *Generator) Generate(sess *Session, fps []*EndpointFingerprint, metrics 
 	mdPath = filepath.Join(g.reportDir, stem+".md")
 	jsonPath = filepath.Join(g.reportDir, stem+".json")
 
-	report := buildReport(sess, fps, metrics, now)
+	report := buildReport(sess, fps, metrics, diag, now)
 
 	jsonData, err := json.MarshalIndent(report, "", "  ")
 	if err != nil {
@@ -96,7 +103,7 @@ func (g *Generator) Generate(sess *Session, fps []*EndpointFingerprint, metrics 
 	return mdPath, jsonPath, nil
 }
 
-func buildReport(sess *Session, fps []*EndpointFingerprint, metrics Metrics, now time.Time) Report {
+func buildReport(sess *Session, fps []*EndpointFingerprint, metrics Metrics, diag DiagnosticsSnapshot, now time.Time) Report {
 	finished := sess.StoppedAt
 	if finished.IsZero() {
 		finished = now
@@ -200,6 +207,14 @@ func buildReport(sess *Session, fps []*EndpointFingerprint, metrics Metrics, now
 		return unknown[i].NormalizedPath < unknown[j].NormalizedPath
 	})
 
+	var rejectionsMap map[string]int
+	if len(diag.Rejections) > 0 {
+		rejectionsMap = make(map[string]int, len(diag.Rejections))
+		for k, v := range diag.Rejections {
+			rejectionsMap[string(k)] = v
+		}
+	}
+
 	return Report{
 		Version:     ReportVersion,
 		SessionID:   sess.ID,
@@ -207,6 +222,8 @@ func buildReport(sess *Session, fps []*EndpointFingerprint, metrics Metrics, now
 		StartedAt:   sess.StartedAt,
 		FinishedAt:  finished,
 		Summary:     summary,
+		Hostnames:   diag.Hostnames,
+		Rejections:  rejectionsMap,
 		Candidates:  candidates,
 		Unknown:     unknown,
 		Warnings:    dedupStrings(sessionWarnings),
@@ -240,6 +257,35 @@ func renderMarkdown(r Report) string {
 	sb.WriteString(fmt.Sprintf("- Payment candidates: %d\n", r.Summary.PaymentCandidates))
 	sb.WriteString(fmt.Sprintf("- Transfer candidates: %d\n", r.Summary.TransferCandidates))
 	sb.WriteString(fmt.Sprintf("- Statement candidates: %d\n\n", r.Summary.StatementCandidates))
+
+	if len(r.Rejections) > 0 {
+		sb.WriteString("## Pipeline Rejection Diagnostics\n\n")
+		sb.WriteString("| Rejection Reason | Count |\n")
+		sb.WriteString("|---|---|\n")
+		var reasons []string
+		for k := range r.Rejections {
+			reasons = append(reasons, k)
+		}
+		sort.Strings(reasons)
+		for _, re := range reasons {
+			sb.WriteString(fmt.Sprintf("| `%s` | %d |\n", re, r.Rejections[re]))
+		}
+		sb.WriteString("\n")
+	}
+
+	if len(r.Hostnames) > 0 {
+		sb.WriteString("## Observed Hostnames Inventory\n\n")
+		sb.WriteString("| Hostname | Allowed | Responses |\n")
+		sb.WriteString("|---|---|---|\n")
+		for _, h := range r.Hostnames {
+			allowedStr := "no"
+			if h.Allowed {
+				allowedStr = "yes"
+			}
+			sb.WriteString(fmt.Sprintf("| `%s` | %s | %d |\n", h.Hostname, allowedStr, h.TotalCount))
+		}
+		sb.WriteString("\n")
+	}
 
 	if len(r.Candidates) > 0 {
 		sb.WriteString("## Endpoint Candidates\n\n")
@@ -285,6 +331,9 @@ func writeFingerprintMD(sb *strings.Builder, fp *EndpointFingerprint) {
 	sb.WriteString(fmt.Sprintf("- **Paginated**: %v\n", fp.IsPaginated))
 	sb.WriteString(fmt.Sprintf("- **Date-range params**: %v\n", fp.HasDateParams))
 	sb.WriteString(fmt.Sprintf("- **Returns list**: %v\n", fp.ReturnsList))
+	if fp.Sanitized {
+		sb.WriteString("- **Credentials sanitized**: yes (secrets stripped)\n")
+	}
 	sb.WriteString(fmt.Sprintf("- **First seen**: %s\n", fp.FirstSeen.Format(time.RFC3339)))
 	sb.WriteString(fmt.Sprintf("- **Last seen**: %s\n", fp.LastSeen.Format(time.RFC3339)))
 

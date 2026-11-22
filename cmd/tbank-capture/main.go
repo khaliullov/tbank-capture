@@ -98,7 +98,7 @@ func run() error {
 	})
 
 	// Response filter
-	filter := capture.NewFilter(log, cfg.MaxResponseBodySize, []string{"tbank.ru"})
+	filter := capture.NewFilter(log, cfg.MaxResponseBodySize, cfg.AllowedDomains)
 
 	// 6. & 7. Browser manager: start Playwright and launch persistent Chromium context
 	mgr := browser.NewManager(log, cfg.UserDataDir, cfg.Headless)
@@ -184,8 +184,9 @@ func run() error {
 	// 4. Store shutdown: Close queue, drain worker, cancel context.
 	log.Info("graceful shutdown initiated")
 
-	// Step 1: Deactivate handler
+	// Step 1: Deactivate handler and wait for in-flight responses
 	handler.Deactivate()
+	handler.Wait()
 
 	// Step 2: Finalize active discovery session if one was running (before terminating store)
 	if sess := collector.ActiveSession(); sess != nil && (sess.Active || sess.State == discovery.SessionStateActive) {
@@ -252,6 +253,7 @@ func (c *controller) StopDiscovery() (mdPath, jsonPath string, err error) {
 	// 1. Stop handler from accepting any new jobs for this session
 	if c.handler != nil {
 		c.handler.StopSession(sessionID)
+		c.handler.Wait()
 	}
 
 	// 2. Mark session as stopping in collector to prevent new events while draining
@@ -279,8 +281,9 @@ func (c *controller) StopDiscovery() (mdPath, jsonPath string, err error) {
 		c.log.Warn("persist session failed", "err", err)
 	}
 
-	// 6. Generate Markdown and JSON reports
-	mdPath, jsonPath, err = c.gen.Generate(sessCopy, fps, metrics)
+	// 6. Generate Markdown and JSON reports with full diagnostic telemetry
+	diag := c.collector.Diagnostics()
+	mdPath, jsonPath, err = c.gen.GenerateWithDiagnostics(sessCopy, fps, metrics, diag)
 	if err != nil {
 		return "", "", fmt.Errorf("generate report: %w", err)
 	}
@@ -294,16 +297,30 @@ func (c *controller) Status() telegram.BotStatus {
 	defer c.mu.Unlock()
 
 	sess := c.collector.ActiveSession()
+	var openPages int
+	var browserReady bool
+	if c.mgr != nil {
+		browserReady = c.mgr.IsRunning()
+		openPages = c.mgr.OpenPagesCount()
+	}
 	st := telegram.BotStatus{
-		BrowserReady: c.mgr != nil && c.mgr.Context() != nil,
+		BrowserReady: browserReady,
+		OpenPages:    openPages,
 		Metrics:      c.collector.Metrics(),
+		Diagnostics:  c.collector.Diagnostics(),
 	}
 	if sess != nil {
-		st.SessionActive = sess.Active
+		st.SessionActive = sess.Active || sess.State == discovery.SessionStateActive
 		st.SessionID = sess.ID
 		st.SessionStart = sess.StartedAt
 	}
 	return st
+}
+
+func (c *controller) Diagnostics() discovery.DiagnosticsSnapshot {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.collector.Diagnostics()
 }
 
 func buildLogger(level string) *slog.Logger {

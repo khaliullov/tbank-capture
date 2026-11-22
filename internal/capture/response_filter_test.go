@@ -1,6 +1,7 @@
 package capture_test
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/khaliullov/tbank-capture/internal/capture"
@@ -140,5 +141,189 @@ func TestFilterAuthPathsExtended(t *testing.T) {
 		if !f.EligiblePath(u) {
 			t.Errorf("expected %s to be eligible path", u)
 		}
+	}
+}
+
+func TestSanitizeCredentials(t *testing.T) {
+	t.Run("strips sensitive fields and preserves business fields", func(t *testing.T) {
+		input := []byte(`{
+			"accountNumber": "40817810000000001234",
+			"balance": 15000.50,
+			"accessToken": "secret-access-token-12345",
+			"refreshToken": "secret-refresh-token-67890",
+			"csrfToken": "csrf-secret-999",
+			"pageToken": "next-page-cursor-token",
+			"operationToken": "op-token-xyz",
+			"nested": {
+				"password": "my-secret-password",
+				"status": "active"
+			},
+			"items": [
+				{"id": 1, "otp": "123456", "name": "Item 1"},
+				{"id": 2, "name": "Item 2"}
+			]
+		}`)
+
+		sanitized, wasSanitized, fields, err := capture.SanitizeCredentials(input)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !wasSanitized {
+			t.Fatal("expected wasSanitized to be true")
+		}
+
+		s := string(sanitized)
+		// Sensitive values and keys must NOT exist in output
+		for _, secret := range []string{
+			"secret-access-token", "secret-refresh-token", "csrf-secret", "my-secret-password", "123456",
+			`"accessToken"`, `"refreshToken"`, `"csrfToken"`, `"password"`, `"otp"`,
+		} {
+			if strings.Contains(s, secret) {
+				t.Errorf("sanitized json should not contain %q, got: %s", secret, s)
+			}
+		}
+
+		// Useful business fields MUST be preserved
+		for _, business := range []string{
+			"accountNumber", "40817810000000001234", "15000.5",
+			"pageToken", "next-page-cursor-token",
+			"operationToken", "op-token-xyz",
+			"status", "active",
+			"Item 1", "Item 2",
+		} {
+			if !strings.Contains(s, business) {
+				t.Errorf("sanitized json must preserve business field %q, got: %s", business, s)
+			}
+		}
+
+		if len(fields) == 0 {
+			t.Error("expected non-empty sanitized fields list")
+		}
+	})
+
+	t.Run("clean payload returns wasSanitized false", func(t *testing.T) {
+		input := []byte(`{"accounts":[{"id":"acc-1","balance":100.0}],"nextPageToken":"p2"}`)
+		sanitized, wasSanitized, fields, err := capture.SanitizeCredentials(input)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if wasSanitized {
+			t.Error("clean payload should not be flagged as sanitized")
+		}
+		if len(fields) > 0 {
+			t.Errorf("clean payload should have no sanitized fields, got %v", fields)
+		}
+		if string(sanitized) != string(input) {
+			t.Errorf("clean payload should be returned unchanged")
+		}
+	})
+
+	t.Run("fails closed on invalid json", func(t *testing.T) {
+		input := []byte(`{invalid-json`)
+		_, _, _, err := capture.SanitizeCredentials(input)
+		if err == nil {
+			t.Fatal("expected error on invalid JSON")
+		}
+	})
+}
+
+func TestFilter_DomainMatching(t *testing.T) {
+	f := capture.NewFilter(noopLogger(), 1024*1024, []string{"tbank.ru", "tinkoff.ru"})
+
+	cases := []struct {
+		url   string
+		valid bool
+	}{
+		// Exact allowed domain
+		{"https://tbank.ru/api/v1", true},
+		{"https://tinkoff.ru/api/v1", true},
+
+		// Subdomains
+		{"https://api.tbank.ru/api/v1", true},
+		{"https://www.tbank.ru/accounts", true},
+		{"https://api.tinkoff.ru/v1", true},
+		{"https://sub.api.tbank.ru/data", true},
+
+		// Case-insensitivity & trailing dot & port
+		{"HTTPS://API.TBANK.RU/test", true},
+		{"https://api.tbank.ru./test", true},
+		{"https://api.tbank.ru:443/test", true},
+		{"https://api.tbank.ru:8443/test", true},
+
+		// Lookalikes & Disallowed domains (MUST FAIL)
+		{"https://not-tbank.ru/api", false},
+		{"https://faketbank.ru/api", false},
+		{"https://tbank.ru.evil.com/api", false},
+		{"https://tinkoff.ru.attacker.org/api", false},
+		{"https://google.com/search", false},
+		{"https://yandex.ru/api", false},
+
+		// Malformed URLs
+		{"not-a-url", false},
+		{"://bad", false},
+		{"", false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.url, func(t *testing.T) {
+			got := f.EligibleURL(tc.url)
+			if got != tc.valid {
+				t.Errorf("EligibleURL(%q) = %v, want %v", tc.url, got, tc.valid)
+			}
+		})
+	}
+}
+
+func TestFilter_CheckEligiblePath_Detailed(t *testing.T) {
+	f := capture.NewFilter(noopLogger(), 1024*1024, []string{"tbank.ru"})
+
+	cases := []struct {
+		url      string
+		eligible bool
+	}{
+		// Auth endpoints: MUST be excluded
+		{"https://tbank.ru/login", false},
+		{"https://tbank.ru/signin", false},
+		{"https://tbank.ru/sign-in", false},
+		{"https://tbank.ru/logout", false},
+		{"https://tbank.ru/signout", false},
+		{"https://tbank.ru/oauth/token", false},
+		{"https://tbank.ru/oauth/authorize", false},
+		{"https://tbank.ru/api/v1/auth/login", false},
+		{"https://tbank.ru/api/v1/auth/token", false},
+		{"https://tbank.ru/api/v1/auth/otp", false},
+		{"https://tbank.ru/api/v1/auth/sms", false},
+		{"https://tbank.ru/api/v1/session/login", false},
+		{"https://tbank.ru/api/v1/session/logout", false},
+		{"https://tbank.ru/passport/login", false},
+		{"https://tbank.ru/sso/callback", false},
+		{"https://tbank.ru/2fa/verify", false},
+
+		// Business endpoints: MUST BE PRESERVED
+		{"https://tbank.ru/api/v1/accounts", true},
+		{"https://tbank.ru/api/v1/accounts/123/operations", true},
+		{"https://tbank.ru/api/v1/cards", true},
+		{"https://tbank.ru/api/v1/cards/authorizations", true}, // Plural: card auth holds!
+		{"https://tbank.ru/api/v1/authorizations", true},       // Plural: card auth holds!
+		{"https://tbank.ru/api/v1/session/accounts", true},     // Session accounts!
+		{"https://tbank.ru/api/v1/session/user", true},         // Session user!
+		{"https://tbank.ru/api/v1/session/products", true},     // Session products!
+		{"https://tbank.ru/api/v1/session/cards", true},        // Session cards!
+		{"https://tbank.ru/api/v1/session/balances", true},     // Session balances!
+		{"https://tbank.ru/api/v1/session/limits", true},       // Session limits!
+		{"https://tbank.ru/api/v1/security/limits", true},      // Security limits!
+		{"https://tbank.ru/api/v1/operations/sign", true},      // Operation sign!
+		{"https://tbank.ru/api/v1/payments/providers", true},
+		{"https://tbank.ru/api/v1/transfers/sbp", true},
+		{"https://tbank.ru/api/v1/statements/statement-1", true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.url, func(t *testing.T) {
+			got := f.EligiblePath(tc.url)
+			if got != tc.eligible {
+				t.Errorf("EligiblePath(%q) = %v, want %v", tc.url, got, tc.eligible)
+			}
+		})
 	}
 }

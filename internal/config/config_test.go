@@ -50,6 +50,41 @@ func TestLoad_ValidDefaults(t *testing.T) {
 	if cfg.LogLevel != "info" {
 		t.Errorf("unexpected log level: %s", cfg.LogLevel)
 	}
+	if len(cfg.AllowedDomains) != 2 || cfg.AllowedDomains[0] != "tbank.ru" || cfg.AllowedDomains[1] != "tinkoff.ru" {
+		t.Errorf("unexpected allowed domains: %v", cfg.AllowedDomains)
+	}
+}
+
+func TestLoad_CustomAllowedDomains(t *testing.T) {
+	env := validBaseEnv()
+	env["CAPTURE_ALLOWED_DOMAINS"] = " api.tbank.ru, TINKOFF.RU. , example.com "
+	setEnvMap(t, env)
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("expected valid load, got error: %v", err)
+	}
+
+	expected := []string{"api.tbank.ru", "tinkoff.ru", "example.com"}
+	if len(cfg.AllowedDomains) != len(expected) {
+		t.Fatalf("expected %d domains, got %d: %v", len(expected), len(cfg.AllowedDomains), cfg.AllowedDomains)
+	}
+	for i, d := range expected {
+		if cfg.AllowedDomains[i] != d {
+			t.Errorf("expected domain %d to be %q, got %q", i, d, cfg.AllowedDomains[i])
+		}
+	}
+}
+
+func TestLoad_EmptyAllowedDomains(t *testing.T) {
+	env := validBaseEnv()
+	env["CAPTURE_ALLOWED_DOMAINS"] = " , , . "
+	setEnvMap(t, env)
+
+	_, err := config.Load()
+	if err == nil {
+		t.Fatal("expected error for empty CAPTURE_ALLOWED_DOMAINS")
+	}
 }
 
 func TestLoad_MissingToken(t *testing.T) {

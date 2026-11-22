@@ -98,6 +98,23 @@ func (m *Manager) Context() pw.BrowserContext {
 	return m.context
 }
 
+// IsRunning returns whether the browser context is active.
+func (m *Manager) IsRunning() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.context != nil
+}
+
+// OpenPagesCount returns the number of open pages/tabs in the browser context.
+func (m *Manager) OpenPagesCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.context == nil {
+		return 0
+	}
+	return len(m.context.Pages())
+}
+
 // NewPage opens a new page in the persistent context.
 func (m *Manager) NewPage() (pw.Page, error) {
 	m.mu.Lock()

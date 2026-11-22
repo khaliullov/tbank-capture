@@ -15,6 +15,7 @@ type mockCommander struct {
 	startCalled int
 	stopCalled  int
 	statusCalls int
+	diagCalls   int
 	active      bool
 	sessID      discovery.SessionID
 }
@@ -42,15 +43,46 @@ func (m *mockCommander) Status() telegram.BotStatus {
 	m.statusCalls++
 	return telegram.BotStatus{
 		BrowserReady:  true,
+		OpenPages:     2,
 		SessionActive: m.active,
 		SessionID:     m.sessID,
 		SessionStart:  time.Now().UTC(),
 		Metrics: discovery.Metrics{
-			TotalObserved:         10,
-			EligibleResponses:     5,
+			Observed:              10,
+			Filtered:              5,
+			Eligible:              5,
+			Processed:             5,
 			UniqueFingerprints:    2,
 			TransactionCandidates: 1,
 		},
+	}
+}
+
+func (m *mockCommander) Diagnostics() discovery.DiagnosticsSnapshot {
+	m.diagCalls++
+	return discovery.DiagnosticsSnapshot{
+		TotalObserved:   10,
+		UniqueHostnames: 2,
+		Hostnames: []discovery.HostnameStats{
+			{Hostname: "api.tbank.ru", TotalCount: 8},
+			{Hostname: "id.tbank.ru", TotalCount: 2},
+		},
+		ResourceDist: map[string]int{
+			"xhr":   6,
+			"fetch": 4,
+		},
+		ContentDist: map[string]int{
+			"application/json": 8,
+			"text/html":        2,
+		},
+		Rejections: map[discovery.RejectionReason]int{
+			discovery.ReasonNonAllowedDomain: 2,
+		},
+		Eligible:            5,
+		Enqueued:            5,
+		Processed:           5,
+		UniqueFingerprints:  2,
+		HasEligibleEnqueued: true,
 	}
 }
 
@@ -87,6 +119,20 @@ func TestCommander_Workflow(t *testing.T) {
 	}
 	if st.Metrics.TransactionCandidates != 1 {
 		t.Errorf("expected 1 candidate, got %d", st.Metrics.TransactionCandidates)
+	}
+	if st.OpenPages != 2 {
+		t.Errorf("expected 2 open pages, got %d", st.OpenPages)
+	}
+
+	diag := cmd.Diagnostics()
+	if diag.TotalObserved != 10 {
+		t.Errorf("expected 10 total observed, got %d", diag.TotalObserved)
+	}
+	if !diag.HasEligibleEnqueued {
+		t.Error("expected HasEligibleEnqueued to be true")
+	}
+	if len(diag.Hostnames) != 2 {
+		t.Errorf("expected 2 hostnames, got %d", len(diag.Hostnames))
 	}
 
 	md, json, err := cmd.StopDiscovery()

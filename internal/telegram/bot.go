@@ -18,15 +18,18 @@ type Commander interface {
 	StartDiscovery() (discovery.SessionID, error)
 	StopDiscovery() (mdPath, jsonPath string, err error)
 	Status() BotStatus
+	Diagnostics() discovery.DiagnosticsSnapshot
 }
 
 // BotStatus carries current application telemetry and session state for display.
 type BotStatus struct {
 	BrowserReady  bool
+	OpenPages     int
 	SessionActive bool
 	SessionID     discovery.SessionID
 	SessionStart  time.Time
 	Metrics       discovery.Metrics
+	Diagnostics   discovery.DiagnosticsSnapshot
 }
 
 // Bot wraps telebot.Bot with strict access controls and safety guards.
@@ -67,6 +70,7 @@ func (b *Bot) registerHandlers() {
 
 	b.bot.Handle("/start", mw(b.handleStart))
 	b.bot.Handle("/status", mw(b.handleStatus))
+	b.bot.Handle("/diagnostics", mw(b.handleDiagnostics))
 	b.bot.Handle("/discovery_start", mw(b.handleDiscoveryStart))
 	b.bot.Handle("/discovery_stop", mw(b.handleDiscoveryStop))
 	b.bot.Handle("/report", mw(b.handleReport))
@@ -103,7 +107,8 @@ func (b *Bot) handleStart(c tele.Context) error {
 	msg := `*T-Bank Capture Control Bot*
 
 Available commands:
-/status — browser and discovery status
+/status — quick health and pipeline status
+/diagnostics — detailed diagnostic telemetry and hostnames
 /discovery_start — begin a discovery session
 /discovery_stop — stop collection and generate reports
 /report — name of the latest report
@@ -114,23 +119,161 @@ Available commands:
 
 func (b *Bot) handleStatus(c tele.Context) error {
 	st := b.commander.Status()
+	diag := b.commander.Diagnostics()
 	var sb strings.Builder
-	sb.WriteString("*Capture Status*\n")
-	sb.WriteString(fmt.Sprintf("Browser ready: %v\n", st.BrowserReady))
-	sb.WriteString(fmt.Sprintf("Session active: %v\n", st.SessionActive))
+	sb.WriteString("*Capture Pipeline Status*\n\n")
+
+	// 1. Is Chromium running?
+	sb.WriteString(fmt.Sprintf("• *Chromium running*: %v (open tabs: %d)\n", st.BrowserReady, st.OpenPages))
+
+	// 2. Is discovery active?
+	sb.WriteString(fmt.Sprintf("• *Discovery active*: %v\n", st.SessionActive))
 	if st.SessionActive {
-		sb.WriteString(fmt.Sprintf("Session ID: `%s`\n", st.SessionID))
-		sb.WriteString(fmt.Sprintf("Started: %s\n", st.SessionStart.Format(time.RFC3339)))
-		m := st.Metrics
-		sb.WriteString(fmt.Sprintf("Observed: %d | Filtered: %d | Eligible: %d | Processed: %d\n",
-			m.Observed, m.Filtered, m.Eligible, m.Processed))
-		sb.WriteString(fmt.Sprintf("Dropped: %d (Queue overflow: %d) | Failed: %d\n",
-			m.Dropped, m.QueueOverflow, m.CaptureFailed))
-		sb.WriteString(fmt.Sprintf("Fingerprints: %d | Transaction candidates: %d\n",
-			m.UniqueFingerprints, m.TransactionCandidates))
-	} else {
-		sb.WriteString("No active session. Use /discovery_start to begin.")
+		sb.WriteString(fmt.Sprintf("  Session ID: `%s`\n", st.SessionID))
+		sb.WriteString(fmt.Sprintf("  Started: %s\n", st.SessionStart.Format(time.RFC3339)))
 	}
+
+	// 3. Is network traffic being observed?
+	networkObserved := diag.TotalObserved > 0
+	sb.WriteString(fmt.Sprintf("• *Network traffic observed*: %v (%d total responses)\n", networkObserved, diag.TotalObserved))
+
+	// 4. Are bank-related domains observed?
+	var bankDomainsObserved bool
+	for _, h := range diag.Hostnames {
+		if strings.Contains(h.Hostname, "tbank.ru") || strings.Contains(h.Hostname, "tinkoff.ru") {
+			bankDomainsObserved = true
+			break
+		}
+	}
+	sb.WriteString(fmt.Sprintf("• *Bank domains observed*: %v (%d unique hostnames)\n", bankDomainsObserved, diag.UniqueHostnames))
+
+	// 5. Are JSON responses received?
+	jsonCount := 0
+	for ct, count := range diag.ContentDist {
+		if strings.Contains(strings.ToLower(ct), "json") {
+			jsonCount += count
+		}
+	}
+	sb.WriteString(fmt.Sprintf("• *JSON responses received*: %v (%d JSON responses)\n", jsonCount > 0, jsonCount))
+
+	// 6. Are responses being rejected?
+	sb.WriteString(fmt.Sprintf("• *Responses rejected*: %d / %d\n", st.Metrics.Filtered, diag.TotalObserved))
+
+	// 7. Are endpoints being discovered?
+	sb.WriteString(fmt.Sprintf("• *Endpoints discovered*: %d unique fingerprints\n", diag.UniqueFingerprints))
+	if st.Metrics.TransactionCandidates > 0 {
+		sb.WriteString(fmt.Sprintf("  Transaction candidates: %d\n", st.Metrics.TransactionCandidates))
+	}
+
+	// Actionable pipeline health warnings
+	sb.WriteString("\n*Pipeline Health Warnings*:\n")
+	warnings := 0
+	if !st.BrowserReady {
+		sb.WriteString("⚠️ Chromium is not running.\n")
+		warnings++
+	} else if !st.SessionActive {
+		sb.WriteString("ℹ️ No active discovery session. Use /discovery_start to begin capturing.\n")
+		warnings++
+	} else {
+		if diag.TotalObserved == 0 {
+			sb.WriteString("⚠️ No network events observed yet. Make sure Chromium is navigating to bank pages.\n")
+			warnings++
+		} else if !bankDomainsObserved {
+			sb.WriteString("⚠️ Network events observed, but no allowed bank domains observed. Check browser URL or CAPTURE_ALLOWED_DOMAINS.\n")
+			warnings++
+		} else if jsonCount == 0 {
+			sb.WriteString("⚠️ Allowed domains observed, but no JSON responses received yet. Navigate to accounts/transactions in the UI.\n")
+			warnings++
+		} else if diag.Eligible == 0 {
+			sb.WriteString("⚠️ JSON responses observed, but all were rejected by filter. Check /diagnostics for rejection reasons.\n")
+			warnings++
+		} else if diag.Enqueued > 0 && diag.Processed == 0 {
+			sb.WriteString("⚠️ Responses enqueued, but not processed yet by worker.\n")
+			warnings++
+		} else if diag.Processed > 0 && diag.UniqueFingerprints == 0 {
+			sb.WriteString("⚠️ Responses processed, but no useful fingerprints discovered yet.\n")
+			warnings++
+		}
+	}
+	if warnings == 0 {
+		sb.WriteString("✅ Pipeline healthy and capturing.\n")
+	}
+
+	return c.Send(sb.String(), tele.ModeMarkdown)
+}
+
+func (b *Bot) handleDiagnostics(c tele.Context) error {
+	st := b.commander.Status()
+	diag := b.commander.Diagnostics()
+
+	var sb strings.Builder
+	sb.WriteString("*Diagnostic Telemetry Snapshot*\n\n")
+
+	sb.WriteString(fmt.Sprintf("*Browser*: Ready=%v, Open tabs=%d\n", st.BrowserReady, st.OpenPages))
+	if st.SessionActive {
+		sb.WriteString(fmt.Sprintf("*Session*: Active (`%s`)\n", st.SessionID))
+	} else {
+		sb.WriteString("*Session*: Inactive\n")
+	}
+
+	sb.WriteString(fmt.Sprintf("\n*Responses*: Total observed=%d, Unique hostnames=%d\n",
+		diag.TotalObserved, diag.UniqueHostnames))
+
+	// Top observed hostnames (up to 5)
+	if len(diag.Hostnames) > 0 {
+		sb.WriteString("\n*Top Hostnames*:\n")
+		limit := 5
+		if len(diag.Hostnames) < limit {
+			limit = len(diag.Hostnames)
+		}
+		for i := 0; i < limit; i++ {
+			h := diag.Hostnames[i]
+			sb.WriteString(fmt.Sprintf("• `%s`: %d\n", h.Hostname, h.TotalCount))
+		}
+	}
+
+	// Resource Type Distribution (XHR/Fetch)
+	xhrFetchCount := 0
+	if c, ok := diag.ResourceDist["xhr"]; ok {
+		xhrFetchCount += c
+	}
+	if c, ok := diag.ResourceDist["fetch"]; ok {
+		xhrFetchCount += c
+	}
+	sb.WriteString(fmt.Sprintf("\n*Resource Types*: XHR/Fetch=%d, Total types=%d\n", xhrFetchCount, len(diag.ResourceDist)))
+	for rt, count := range diag.ResourceDist {
+		sb.WriteString(fmt.Sprintf("• `%s`: %d\n", rt, count))
+	}
+
+	// JSON response count
+	jsonCount := 0
+	for ct, count := range diag.ContentDist {
+		if strings.Contains(strings.ToLower(ct), "json") {
+			jsonCount += count
+		}
+	}
+	sb.WriteString(fmt.Sprintf("\n*JSON Responses*: %d\n", jsonCount))
+
+	// Rejections by reason
+	sb.WriteString(fmt.Sprintf("\n*Rejections by Reason* (Total filtered: %d):\n", st.Metrics.Filtered))
+	if len(diag.Rejections) == 0 {
+		sb.WriteString("• None\n")
+	} else {
+		for reason, count := range diag.Rejections {
+			sb.WriteString(fmt.Sprintf("• `%s`: %d\n", reason, count))
+		}
+	}
+
+	// Queue & processing stats
+	sb.WriteString("\n*Queue & Processing*:\n")
+	sb.WriteString(fmt.Sprintf("• Eligible responses: %d\n", diag.Eligible))
+	sb.WriteString(fmt.Sprintf("• Enqueued jobs: %d\n", diag.Enqueued))
+	sb.WriteString(fmt.Sprintf("• Ever reached queue: %v\n", diag.HasEligibleEnqueued))
+	sb.WriteString(fmt.Sprintf("• Queue overflow: %d\n", diag.QueueOverflow))
+	sb.WriteString(fmt.Sprintf("• Processed jobs: %d\n", diag.Processed))
+	sb.WriteString(fmt.Sprintf("• Processing failures: %d\n", diag.ProcessingFailed))
+	sb.WriteString(fmt.Sprintf("• Unique fingerprints: %d\n", diag.UniqueFingerprints))
+
 	return c.Send(sb.String(), tele.ModeMarkdown)
 }
 

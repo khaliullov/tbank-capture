@@ -27,6 +27,13 @@ type Collector struct {
 	fingerprints map[FingerprintID]*EndpointFingerprint
 	bodyHashes   map[FingerprintID]map[string]bool
 
+	// Passive hostname and diagnostic telemetry
+	hostnames    map[string]*HostnameStats
+	rejections   map[RejectionReason]int
+	resourceDist map[string]int
+	contentDist  map[string]int
+	statusDist   map[int]int
+
 	// Unified metrics counters
 	observed      int
 	filtered      int
@@ -47,6 +54,11 @@ func NewCollector(log *slog.Logger, sessionDir string, cfg AnalyzerConfig) *Coll
 		analyzerCfg:  cfg,
 		fingerprints: make(map[FingerprintID]*EndpointFingerprint),
 		bodyHashes:   make(map[FingerprintID]map[string]bool),
+		hostnames:    make(map[string]*HostnameStats),
+		rejections:   make(map[RejectionReason]int),
+		resourceDist: make(map[string]int),
+		contentDist:  make(map[string]int),
+		statusDist:   make(map[int]int),
 	}
 }
 
@@ -108,6 +120,171 @@ func (c *Collector) IncrObserved() {
 	c.mu.Lock()
 	c.observed++
 	c.mu.Unlock()
+}
+
+// RecordObservation records an observed HTTP response for passive telemetry.
+func (c *Collector) RecordObservation(host string, isAllowed bool, resourceType, contentType string, status int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.observed++
+	if resourceType != "" {
+		c.resourceDist[resourceType]++
+	}
+	if contentType != "" {
+		cleanCT := contentType
+		if idx := strings.Index(cleanCT, ";"); idx >= 0 {
+			cleanCT = strings.TrimSpace(cleanCT[:idx])
+		}
+		c.contentDist[cleanCT]++
+	}
+	if status > 0 {
+		c.statusDist[status]++
+	}
+
+	if host == "" {
+		host = "[unknown]"
+	}
+
+	stats, exists := c.hostnames[host]
+	if !exists {
+		if len(c.hostnames) < 500 {
+			stats = &HostnameStats{
+				Hostname:     host,
+				Allowed:      isAllowed,
+				ResourceDist: make(map[string]int),
+				ContentDist:  make(map[string]int),
+				StatusDist:   make(map[int]int),
+			}
+			c.hostnames[host] = stats
+		} else {
+			host = "[other]"
+			stats, exists = c.hostnames[host]
+			if !exists {
+				stats = &HostnameStats{
+					Hostname:     host,
+					ResourceDist: make(map[string]int),
+					ContentDist:  make(map[string]int),
+					StatusDist:   make(map[int]int),
+				}
+				c.hostnames[host] = stats
+			}
+		}
+	}
+
+	stats.TotalCount++
+	if resourceType != "" {
+		stats.ResourceDist[resourceType]++
+	}
+	if contentType != "" {
+		cleanCT := contentType
+		if idx := strings.Index(cleanCT, ";"); idx >= 0 {
+			cleanCT = strings.TrimSpace(cleanCT[:idx])
+		}
+		stats.ContentDist[cleanCT]++
+	}
+	if status > 0 {
+		stats.StatusDist[status]++
+	}
+}
+
+// RecordRejection records a terminal rejection reason for an observed response.
+func (c *Collector) RecordRejection(reason RejectionReason) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.filtered++
+	c.rejections[reason]++
+}
+
+// RecordEnqueued records that an eligible job was successfully submitted to the queue.
+func (c *Collector) RecordEnqueued() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.eligible++
+	c.enqueued++
+	c.rejections[ReasonSuccessfullyEnqueued]++
+}
+
+// RecordQueueOverflow records that an eligible job could not be submitted due to queue saturation.
+func (c *Collector) RecordQueueOverflow() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.eligible++
+	c.queueOverflow++
+	c.dropped++
+	c.rejections[ReasonQueueFull]++
+}
+
+// Diagnostics returns a thread-safe snapshot of diagnostic telemetry.
+func (c *Collector) Diagnostics() DiagnosticsSnapshot {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	hostList := make([]HostnameStats, 0, len(c.hostnames))
+	for _, hs := range c.hostnames {
+		hCopy := HostnameStats{
+			Hostname:     hs.Hostname,
+			TotalCount:   hs.TotalCount,
+			Allowed:      hs.Allowed,
+			ResourceDist: copyMapStringInt(hs.ResourceDist),
+			ContentDist:  copyMapStringInt(hs.ContentDist),
+			StatusDist:   copyMapIntInt(hs.StatusDist),
+		}
+		hostList = append(hostList, hCopy)
+	}
+	sort.Slice(hostList, func(i, j int) bool {
+		if hostList[i].TotalCount != hostList[j].TotalCount {
+			return hostList[i].TotalCount > hostList[j].TotalCount
+		}
+		return hostList[i].Hostname < hostList[j].Hostname
+	})
+
+	rejectionsCopy := make(map[RejectionReason]int, len(c.rejections))
+	for k, v := range c.rejections {
+		rejectionsCopy[k] = v
+	}
+
+	return DiagnosticsSnapshot{
+		TotalObserved:       c.observed,
+		UniqueHostnames:     len(c.hostnames),
+		Hostnames:           hostList,
+		ResourceDist:        copyMapStringInt(c.resourceDist),
+		ContentDist:         copyMapStringInt(c.contentDist),
+		StatusDist:          copyMapIntInt(c.statusDist),
+		Rejections:          rejectionsCopy,
+		Eligible:            c.eligible,
+		Enqueued:            c.enqueued,
+		QueueOverflow:       c.queueOverflow,
+		Processed:           c.processed,
+		ProcessingFailed:    c.captureFailed,
+		UniqueFingerprints:  len(c.fingerprints),
+		HasEligibleEnqueued: c.enqueued > 0,
+	}
+}
+
+func copyMapStringInt(src map[string]int) map[string]int {
+	if src == nil {
+		return make(map[string]int)
+	}
+	dst := make(map[string]int, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
+}
+
+func copyMapIntInt(src map[int]int) map[int]int {
+	if src == nil {
+		return make(map[int]int)
+	}
+	dst := make(map[int]int, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
 }
 
 // IncrFiltered increments the filtered response counter.
@@ -189,6 +366,11 @@ func (c *Collector) StartSession(id SessionID) {
 	c.dropped = 0
 	c.captureFailed = 0
 	c.queueOverflow = 0
+	c.rejections = make(map[RejectionReason]int)
+	c.hostnames = make(map[string]*HostnameStats)
+	c.resourceDist = make(map[string]int)
+	c.contentDist = make(map[string]int)
+	c.statusDist = make(map[int]int)
 
 	c.log.Info("discovery session started", "sessionID", id)
 }
@@ -282,17 +464,18 @@ func (c *Collector) ProcessJob(job CaptureJob) {
 	if c.session == nil || (c.session.State != SessionStateActive && c.session.State != SessionStateStopping) || job.SessionID == "" || job.SessionID != c.session.ID {
 		if c.session != nil && (c.session.State == SessionStateActive || c.session.State == SessionStateStopping) {
 			c.dropped++
+			c.rejections[ReasonProcessingFailed]++
 		} else {
 			c.filtered++
+			c.rejections[ReasonNoActiveSession]++
 		}
 		return
 	}
 
-	c.processed++
-
+	var hasError bool
 	var warnings []string
 	if job.BodyError != "" {
-		c.captureFailed++
+		hasError = true
 		warningMsg := fmt.Sprintf("body retrieval failed: %s", job.BodyError)
 		warnings = append(warnings, warningMsg)
 		c.log.Debug("body retrieval issue", "url", sanitizeURLForLog(job.URL), "err", job.BodyError)
@@ -305,11 +488,19 @@ func (c *Collector) ProcessJob(job CaptureJob) {
 		var err error
 		fields, topKind, err = AnalyzeJSON(job.Body, c.analyzerCfg)
 		if err != nil {
-			c.captureFailed++
+			hasError = true
 			warningMsg := fmt.Sprintf("json analysis error: %s", err)
 			warnings = append(warnings, warningMsg)
 			c.log.Debug("json analysis issue", "err", err)
 		}
+	}
+
+	c.processed++
+	if hasError {
+		c.captureFailed++
+		c.rejections[ReasonProcessingFailed]++
+	} else {
+		c.rejections[ReasonSuccessfullyProcessed]++
 	}
 
 	structHash := structureHashFromFields(fields)
@@ -332,13 +523,19 @@ func (c *Collector) ProcessJob(job CaptureJob) {
 			SchemaFields:    fields,
 			StatusDist:      make(StatusDist),
 			FirstSeen:       now,
+			Sanitized:       job.Sanitized,
 			CaptureWarnings: warnings,
 		}
 		c.fingerprints[fpID] = fp
 		c.bodyHashes[fpID] = make(map[string]bool)
 		c.log.Info("new endpoint fingerprint", "id", fpID, "path", normPath)
-	} else if len(warnings) > 0 {
-		fp.CaptureWarnings = appendUniqueStrings(fp.CaptureWarnings, warnings)
+	} else {
+		if job.Sanitized {
+			fp.Sanitized = true
+		}
+		if len(warnings) > 0 {
+			fp.CaptureWarnings = appendUniqueStrings(fp.CaptureWarnings, warnings)
+		}
 	}
 
 	// Update fingerprint metrics
