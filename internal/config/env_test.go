@@ -115,3 +115,55 @@ CAPTURE_ALLOWED_DOMAINS="tbank.ru,tinkoff.ru,custom.bank.ru"
 		t.Errorf("expected 3 allowed domains with custom.bank.ru, got %v", cfg.AllowedDomains)
 	}
 }
+
+func TestLoadEnv_UnreadableFile(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("skipping permission test when running as root")
+	}
+
+	tmpDir := t.TempDir()
+	envPath := filepath.Join(tmpDir, ".env.unreadable")
+	if err := os.WriteFile(envPath, []byte("SECRET=123"), 0000); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	defer func() {
+		_ = os.Chmod(envPath, 0600)
+		_ = os.Remove(envPath)
+	}()
+
+	err := config.LoadEnv(envPath)
+	if err == nil {
+		t.Error("expected error loading unreadable env file, got nil")
+	}
+}
+
+func TestLoad_UnreadableDotEnvError(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("skipping permission test when running as root")
+	}
+
+	tmpDir := t.TempDir()
+	origWd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	defer func() { _ = os.Chdir(origWd) }()
+
+	envPath := filepath.Join(tmpDir, ".env")
+	if err := os.WriteFile(envPath, []byte("TELEGRAM_BOT_TOKEN=abc\nTELEGRAM_CHAT_ID=123"), 0000); err != nil {
+		t.Fatalf("write .env: %v", err)
+	}
+	defer func() {
+		_ = os.Chmod(envPath, 0600)
+		_ = os.Remove(envPath)
+	}()
+
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+
+	_, err = config.Load()
+	if err == nil {
+		t.Error("expected error when .env file is unreadable, got nil")
+	}
+}

@@ -1,9 +1,12 @@
 package capture_test
 
 import (
+	"errors"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/khaliullov/tbank-capture/internal/capture"
 	"github.com/khaliullov/tbank-capture/internal/discovery"
@@ -43,20 +46,50 @@ func (m *mockResponse) Body() ([]byte, error) {
 	return m.bodyBytes, m.bodyErr
 }
 
+// blockingResponse wraps mockResponse and triggers a callback when Body() is invoked.
+type blockingResponse struct {
+	mockResponse
+	onBody func()
+}
+
+func (b *blockingResponse) Body() ([]byte, error) {
+	if b.onBody != nil {
+		b.onBody()
+	}
+	return b.mockResponse.Body()
+}
+
 // mockSubmitter records submitted jobs.
 type mockSubmitter struct {
+	mu      sync.Mutex
 	jobs    []discovery.CaptureJob
 	accept  bool
 	invoked int
 }
 
 func (m *mockSubmitter) Submit(job discovery.CaptureJob) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.invoked++
 	if m.accept {
 		m.jobs = append(m.jobs, job)
 		return true
 	}
 	return false
+}
+
+func (m *mockSubmitter) Jobs() []discovery.CaptureJob {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cp := make([]discovery.CaptureJob, len(m.jobs))
+	copy(cp, m.jobs)
+	return cp
+}
+
+func (m *mockSubmitter) Invoked() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.invoked
 }
 
 func createTestHandler(submitter capture.JobSubmitter, col *discovery.Collector, maxBody int64) *capture.ResponseHandler {
@@ -274,4 +307,225 @@ func TestResponseHandler_AuthSecretSanitized(t *testing.T) {
 	if !strings.Contains(bodyStr, "40817810000000001234") || !strings.Contains(bodyStr, "15000") {
 		t.Errorf("business fields missing from sanitized job body: %s", bodyStr)
 	}
+}
+
+// TestResponseHandler_MetadataOnlyFailureOnBodyError verifies that when resp.Body() fails,
+// a metadata-only event is created without URL query params or secrets and enqueued without error.
+func TestResponseHandler_MetadataOnlyFailureOnBodyError(t *testing.T) {
+	sub := &mockSubmitter{accept: true}
+	col := newTestCollector(t)
+	col.StartSession("test-session")
+
+	h := createTestHandler(sub, col, 1024)
+
+	req := &mockRequest{method: "GET", resType: "fetch", url: "https://www.tbank.ru/api/v1/fail?token=secret123&user=john"}
+	resp := &mockResponse{
+		url:         "https://www.tbank.ru/api/v1/fail?token=secret123&user=john",
+		status:      502,
+		headers:     map[string]string{"content-type": "application/json"},
+		bodyBytes:   nil,
+		bodyErr:     errors.New("target closed"),
+		requestMock: req,
+	}
+
+	h.HandleResponse(resp)
+
+	jobs := sub.Jobs()
+	if len(jobs) != 1 {
+		t.Fatalf("expected 1 metadata-only job submitted on Body() error, got %d", len(jobs))
+	}
+	job := jobs[0]
+	if job.Body != nil {
+		t.Errorf("expected Body == nil on error, got %v", job.Body)
+	}
+	if job.BodySize != 0 {
+		t.Errorf("expected BodySize == 0 on error, got %d", job.BodySize)
+	}
+	if job.RawBodySize != 0 {
+		t.Errorf("expected RawBodySize == 0 on error, got %d", job.RawBodySize)
+	}
+	if job.BodyError != "target closed" {
+		t.Errorf("expected BodyError == 'target closed', got %q", job.BodyError)
+	}
+	if strings.Contains(job.URL, "secret123") || strings.Contains(job.URL, "john") || strings.Contains(job.URL, "?") {
+		t.Errorf("query parameters or credentials leaked in metadata-only URL: %s", job.URL)
+	}
+	if job.Status != 502 {
+		t.Errorf("expected Status == 502, got %d", job.Status)
+	}
+	if job.Method != "GET" {
+		t.Errorf("expected Method == 'GET', got %q", job.Method)
+	}
+}
+
+// TestResponseHandler_RawBodySizePreserved verifies that raw network response size is
+// preserved separately from sanitized body size.
+func TestResponseHandler_RawBodySizePreserved(t *testing.T) {
+	sub := &mockSubmitter{accept: true}
+	col := newTestCollector(t)
+	col.StartSession("test-session")
+
+	h := createTestHandler(sub, col, 1024)
+
+	rawBody := []byte(`{"accessToken": "super-secret-token-abcdef1234567890", "id": 12345, "amount": 500}`)
+	req := &mockRequest{method: "POST", resType: "xhr", url: "https://www.tbank.ru/api/v1/data"}
+	resp := &mockResponse{
+		url:         "https://www.tbank.ru/api/v1/data",
+		status:      200,
+		headers:     map[string]string{"content-type": "application/json"},
+		bodyBytes:   rawBody,
+		requestMock: req,
+	}
+
+	h.HandleResponse(resp)
+
+	jobs := sub.Jobs()
+	if len(jobs) != 1 {
+		t.Fatalf("expected 1 job submitted, got %d", len(jobs))
+	}
+	job := jobs[0]
+	if job.RawBodySize != int64(len(rawBody)) {
+		t.Errorf("expected RawBodySize == %d, got %d", len(rawBody), job.RawBodySize)
+	}
+	if job.BodySize != int64(len(job.Body)) {
+		t.Errorf("expected BodySize == %d, got %d", len(job.Body), job.BodySize)
+	}
+	if job.RawBodySize <= job.BodySize {
+		t.Errorf("expected RawBodySize (%d) > BodySize (%d) after sanitization", job.RawBodySize, job.BodySize)
+	}
+}
+
+// TestResponseHandler_WorkerQueueBoundedOverflow verifies that the bounded worker queue
+// drops incoming responses and increments overflow metrics without spawning goroutines or blocking.
+func TestResponseHandler_WorkerQueueBoundedOverflow(t *testing.T) {
+	col := newTestCollector(t)
+	col.StartSession("test-session")
+
+	filter := capture.NewFilter(noopLogger(), 1024, []string{"tbank.ru"})
+	dummyChan := make(chan discovery.CaptureJob, 10)
+
+	// Create handler with 1 worker and 1 queue capacity
+	h := capture.NewResponseHandler(noopLogger(), filter, dummyChan, func() discovery.SessionID {
+		return "test-session"
+	}, 1024, capture.WithWorkerCount(1), capture.WithQueueCapacity(1))
+
+	sub := &mockSubmitter{accept: true}
+	h.SetSubmitter(sub)
+	h.SetCollector(col)
+	defer h.Deactivate()
+
+	workerBlocked := make(chan struct{})
+	workerRelease := make(chan struct{})
+
+	blockingReq := &mockRequest{method: "GET", resType: "xhr", url: "https://www.tbank.ru/api/v1/block"}
+	blockingResp := &blockingResponse{
+		mockResponse: mockResponse{
+			url:         "https://www.tbank.ru/api/v1/block",
+			status:      200,
+			headers:     map[string]string{"content-type": "application/json"},
+			bodyBytes:   []byte(`{"id": 1}`),
+			requestMock: blockingReq,
+		},
+		onBody: func() {
+			close(workerBlocked)
+			<-workerRelease
+		},
+	}
+
+	// 1. Enqueue blocking response; worker will pick it up and block in Body()
+	h.Enqueue(blockingResp)
+	<-workerBlocked
+
+	// 2. Worker is busy. Send 1 response to fill the queue (capacity 1)
+	req2 := &mockRequest{method: "GET", resType: "xhr", url: "https://www.tbank.ru/api/v1/fill"}
+	resp2 := &mockResponse{
+		url:         "https://www.tbank.ru/api/v1/fill",
+		status:      200,
+		headers:     map[string]string{"content-type": "application/json"},
+		bodyBytes:   []byte(`{"id": 2}`),
+		requestMock: req2,
+	}
+	h.Enqueue(resp2)
+
+	// 3. Queue is now full (1 worker busy, 1 in queue). Send 3rd response; must overflow immediately
+	req3 := &mockRequest{method: "GET", resType: "xhr", url: "https://www.tbank.ru/api/v1/overflow"}
+	resp3 := &mockResponse{
+		url:         "https://www.tbank.ru/api/v1/overflow",
+		status:      200,
+		headers:     map[string]string{"content-type": "application/json"},
+		bodyBytes:   []byte(`{"id": 3}`),
+		requestMock: req3,
+	}
+	h.Enqueue(resp3)
+
+	if h.CountQueueFull() < 1 {
+		t.Errorf("expected CountQueueFull >= 1 on worker queue overflow, got %d", h.CountQueueFull())
+	}
+	if m := col.Metrics(); m.QueueOverflows < 1 {
+		t.Errorf("expected col.Metrics().QueueOverflows >= 1, got %d", m.QueueOverflows)
+	}
+
+	// Unblock worker and wait for clean drain
+	close(workerRelease)
+	h.Wait()
+}
+
+// TestResponseHandler_ConcurrentShutdownRace tests that concurrent calls to
+// Enqueue, Wait, StopSession, and Deactivate do not cause data races or panics.
+func TestResponseHandler_ConcurrentShutdownRace(t *testing.T) {
+	col := newTestCollector(t)
+	col.StartSession("test-session")
+
+	filter := capture.NewFilter(noopLogger(), 1024, []string{"tbank.ru"})
+	dummyChan := make(chan discovery.CaptureJob, 20)
+	h := capture.NewResponseHandler(noopLogger(), filter, dummyChan, func() discovery.SessionID {
+		return "test-session"
+	}, 1024, capture.WithWorkerCount(4), capture.WithQueueCapacity(32))
+
+	sub := &mockSubmitter{accept: true}
+	h.SetSubmitter(sub)
+	h.SetCollector(col)
+
+	var wg sync.WaitGroup
+	// Launch producers
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			req := &mockRequest{method: "GET", resType: "xhr", url: "https://www.tbank.ru/api/v1/test"}
+			resp := &mockResponse{
+				url:         "https://www.tbank.ru/api/v1/test",
+				status:      200,
+				headers:     map[string]string{"content-type": "application/json"},
+				bodyBytes:   []byte(`{"id": 1}`),
+				requestMock: req,
+			}
+			for j := 0; j < 10; j++ {
+				h.Enqueue(resp)
+				time.Sleep(100 * time.Microsecond)
+			}
+		}(i)
+	}
+
+	// Launch concurrent callers of StopSession and Wait
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 5; j++ {
+				h.StopSession("test-session")
+				h.Wait()
+				time.Sleep(200 * time.Microsecond)
+			}
+		}()
+	}
+
+	// Launch deactivator
+	go func() {
+		time.Sleep(2 * time.Millisecond)
+		h.Deactivate()
+	}()
+
+	wg.Wait()
+	h.Deactivate() // Idempotent second deactivation
 }

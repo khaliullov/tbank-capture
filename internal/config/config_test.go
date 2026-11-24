@@ -47,6 +47,12 @@ func TestLoad_ValidDefaults(t *testing.T) {
 	if cfg.CaptureQueueSize != 128 {
 		t.Errorf("unexpected queue size: %d", cfg.CaptureQueueSize)
 	}
+	if cfg.ResponseWorkerCount != 8 {
+		t.Errorf("unexpected response worker count: %d", cfg.ResponseWorkerCount)
+	}
+	if cfg.ResponseQueueSize != 256 {
+		t.Errorf("unexpected response queue size: %d", cfg.ResponseQueueSize)
+	}
 	if cfg.LogLevel != "info" {
 		t.Errorf("unexpected log level: %s", cfg.LogLevel)
 	}
@@ -208,5 +214,89 @@ func TestLoad_NeverExposesTokenInError(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), secretToken) {
 		t.Fatalf("CRITICAL SECURITY VIOLATION: secret bot token leaked in error message: %s", err.Error())
+	}
+}
+
+func TestLoad_ResponseWorkerAndQueue(t *testing.T) {
+	// Custom valid values
+	env := validBaseEnv()
+	env["RESPONSE_WORKER_COUNT"] = "16"
+	env["RESPONSE_QUEUE_SIZE"] = "512"
+	setEnvMap(t, env)
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("expected valid load, got: %v", err)
+	}
+	if cfg.ResponseWorkerCount != 16 {
+		t.Errorf("expected ResponseWorkerCount=16, got %d", cfg.ResponseWorkerCount)
+	}
+	if cfg.ResponseQueueSize != 512 {
+		t.Errorf("expected ResponseQueueSize=512, got %d", cfg.ResponseQueueSize)
+	}
+
+	// Invalid worker count
+	invalidWorkerCases := []string{"0", "-1", "abc"}
+	for _, val := range invalidWorkerCases {
+		env := validBaseEnv()
+		env["RESPONSE_WORKER_COUNT"] = val
+		setEnvMap(t, env)
+		if _, err := config.Load(); err == nil {
+			t.Errorf("expected error for RESPONSE_WORKER_COUNT=%q", val)
+		}
+	}
+
+	// Invalid queue size
+	invalidQueueCases := []string{"0", "-5", "xyz"}
+	for _, val := range invalidQueueCases {
+		env := validBaseEnv()
+		env["RESPONSE_QUEUE_SIZE"] = val
+		setEnvMap(t, env)
+		if _, err := config.Load(); err == nil {
+			t.Errorf("expected error for RESPONSE_QUEUE_SIZE=%q", val)
+		}
+	}
+}
+
+func TestCheckDirPermissions(t *testing.T) {
+	// 1. Non-existent path should return nil (can be created later)
+	nonExistent := "/tmp/test_dir_does_not_exist_987654321"
+	if err := config.CheckDirPermissions(nonExistent); err != nil {
+		t.Errorf("expected nil for non-existent dir, got: %v", err)
+	}
+
+	// 2. Existing writable directory should return nil
+	tmpDir := t.TempDir()
+	if err := config.CheckDirPermissions(tmpDir); err != nil {
+		t.Errorf("expected nil for writable dir, got: %v", err)
+	}
+
+	// 3. Existing path that is a file, not a directory
+	tmpFile := os.TempDir() + "/test_file_not_dir_" + t.Name()
+	if err := os.WriteFile(tmpFile, []byte("content"), 0600); err != nil {
+		t.Fatalf("create temp file: %v", err)
+	}
+	defer os.Remove(tmpFile)
+
+	if err := config.CheckDirPermissions(tmpFile); err == nil {
+		t.Error("expected error for regular file, got nil")
+	} else if !strings.Contains(err.Error(), "not a directory") {
+		t.Errorf("expected 'not a directory' error, got: %v", err)
+	}
+
+	// 4. Existing read-only directory (non-writable)
+	readOnlyDir := t.TempDir() + "/readonly"
+	if err := os.Mkdir(readOnlyDir, 0500); err != nil {
+		t.Fatalf("mkdir read only: %v", err)
+	}
+	defer func() {
+		_ = os.Chmod(readOnlyDir, 0700)
+		_ = os.Remove(readOnlyDir)
+	}()
+
+	if err := config.CheckDirPermissions(readOnlyDir); err == nil {
+		t.Error("expected error for read-only dir, got nil")
+	} else if !strings.Contains(err.Error(), "not writable") {
+		t.Errorf("expected 'not writable' error, got: %v", err)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	pw "github.com/playwright-community/playwright-go"
 )
@@ -20,18 +21,27 @@ func NewNavigator(log *slog.Logger, page pw.Page) *Navigator {
 }
 
 // GotoURL navigates the page to the given URL and waits for load.
+// Query parameters are stripped before logging or formatting into error messages.
 func (n *Navigator) GotoURL(_ context.Context, url string) error {
-	n.log.Info("navigating", "url", url)
+	sanitizedURL := stripQuery(url)
+	n.log.Info("navigating", "url", sanitizedURL)
 	resp, err := n.page.Goto(url, pw.PageGotoOptions{
 		WaitUntil: pw.WaitUntilStateLoad,
 	})
 	if err != nil {
-		return fmt.Errorf("goto %s: %w", url, err)
+		return fmt.Errorf("goto %s: %w", sanitizedURL, err)
 	}
 	if resp != nil {
 		n.log.Debug("navigation response", "status", resp.Status())
 	}
 	return nil
+}
+
+func stripQuery(rawURL string) string {
+	if idx := strings.Index(rawURL, "?"); idx >= 0 {
+		return rawURL[:idx]
+	}
+	return rawURL
 }
 
 // Page returns the underlying playwright Page.

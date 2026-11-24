@@ -51,7 +51,11 @@ func NewBot(log *slog.Logger, token string, allowedChatID int64, reportDir strin
 
 	bot, err := tele.NewBot(settings)
 	if err != nil {
-		return nil, fmt.Errorf("create telebot: %w", err)
+		cleanErr := err.Error()
+		if token != "" {
+			cleanErr = strings.ReplaceAll(cleanErr, token, "[REDACTED]")
+		}
+		return nil, fmt.Errorf("create telebot: %s", cleanErr)
 	}
 
 	b := &Bot{

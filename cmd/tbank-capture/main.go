@@ -58,6 +58,9 @@ func run() error {
 		if err := os.MkdirAll(dir, 0700); err != nil {
 			return fmt.Errorf("create directory %s: %w", dir, err)
 		}
+		if err := config.CheckDirPermissions(dir); err != nil {
+			return err
+		}
 	}
 
 	// Context for graceful shutdown on OS signals (SIGINT, SIGTERM)
@@ -128,6 +131,8 @@ func run() error {
 			return sess.ID
 		},
 		cfg.MaxResponseBodySize,
+		capture.WithWorkerCount(cfg.ResponseWorkerCount),
+		capture.WithQueueCapacity(cfg.ResponseQueueSize),
 	)
 	handler.SetCollector(collector)
 	handler.SetSubmitter(store)

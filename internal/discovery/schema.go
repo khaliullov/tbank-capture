@@ -39,7 +39,10 @@ func AnalyzeJSON(data []byte, cfg AnalyzerConfig) ([]FieldSchema, JSONKind, erro
 	}
 
 	a := newAnalyzer(cfg)
-	a.walk("$", root, 0, false)
+	if _, isMap := root.(map[string]interface{}); isMap {
+		a.scopeCounts["$"] = 1
+	}
+	a.walk("$", root, 0, false, "")
 
 	return a.results(), topKind(root), nil
 }
@@ -65,6 +68,7 @@ func topKind(v interface{}) JSONKind {
 
 type schemaEntry struct {
 	path           string
+	parentPath     string
 	types          map[string]bool
 	count          int
 	inArray        bool
@@ -74,18 +78,20 @@ type schemaEntry struct {
 }
 
 type analyzer struct {
-	cfg     AnalyzerConfig
-	entries map[string]*schemaEntry
+	cfg         AnalyzerConfig
+	entries     map[string]*schemaEntry
+	scopeCounts map[string]int // tracks total inspected instances of objects/collections by scope path
 }
 
 func newAnalyzer(cfg AnalyzerConfig) *analyzer {
 	return &analyzer{
-		cfg:     cfg,
-		entries: make(map[string]*schemaEntry, 64),
+		cfg:         cfg,
+		entries:     make(map[string]*schemaEntry, 64),
+		scopeCounts: make(map[string]int, 32),
 	}
 }
 
-func (a *analyzer) walk(path string, v interface{}, depth int, inArray bool) {
+func (a *analyzer) walk(path string, v interface{}, depth int, inArray bool, parentPath string) {
 	if depth > a.cfg.MaxDepth {
 		return
 	}
@@ -95,7 +101,10 @@ func (a *analyzer) walk(path string, v interface{}, depth int, inArray bool) {
 	switch val := v.(type) {
 	case map[string]interface{}:
 		if path != "$" {
-			a.recordField(path, typeName, depth > 1, inArray)
+			a.recordField(path, parentPath, typeName, depth > 1, inArray)
+			if !strings.HasSuffix(path, "[]") {
+				a.scopeCounts[path]++
+			}
 		}
 
 		// Sort keys for deterministic traversal.
@@ -107,12 +116,12 @@ func (a *analyzer) walk(path string, v interface{}, depth int, inArray bool) {
 
 		for _, k := range keys {
 			childPath := formatPropertyPath(path, k)
-			a.walk(childPath, val[k], depth+1, inArray)
+			a.walk(childPath, val[k], depth+1, inArray, path)
 		}
 
 	case []interface{}:
 		if path != "$" {
-			a.recordCollection(path, depth > 1, inArray)
+			a.recordCollection(path, parentPath, depth > 1, inArray)
 		}
 
 		limit := len(val)
@@ -121,18 +130,20 @@ func (a *analyzer) walk(path string, v interface{}, depth int, inArray bool) {
 		}
 
 		elemPath := path + "[]"
+		a.scopeCounts[elemPath] += limit
+
 		for i := 0; i < limit; i++ {
-			a.walk(elemPath, val[i], depth+1, true)
+			a.walk(elemPath, val[i], depth+1, true, path)
 		}
 
 	default:
 		if path != "$" {
-			a.recordField(path, typeName, depth > 1, inArray)
+			a.recordField(path, parentPath, typeName, depth > 1, inArray)
 		}
 	}
 }
 
-func (a *analyzer) recordField(path, typeName string, nested, inArray bool) {
+func (a *analyzer) recordField(path, parentPath, typeName string, nested, inArray bool) {
 	e, exists := a.entries[path]
 	if exists {
 		e.count++
@@ -146,6 +157,7 @@ func (a *analyzer) recordField(path, typeName string, nested, inArray bool) {
 
 	a.entries[path] = &schemaEntry{
 		path:           path,
+		parentPath:     parentPath,
 		types:          map[string]bool{typeName: true},
 		count:          1,
 		inArray:        inArray,
@@ -154,7 +166,7 @@ func (a *analyzer) recordField(path, typeName string, nested, inArray bool) {
 	}
 }
 
-func (a *analyzer) recordCollection(path string, nested, inArray bool) {
+func (a *analyzer) recordCollection(path, parentPath string, nested, inArray bool) {
 	e, exists := a.entries[path]
 	if exists {
 		e.count++
@@ -168,6 +180,7 @@ func (a *analyzer) recordCollection(path string, nested, inArray bool) {
 
 	a.entries[path] = &schemaEntry{
 		path:           path,
+		parentPath:     parentPath,
 		types:          map[string]bool{"array": true},
 		count:          1,
 		inArray:        inArray,
@@ -176,13 +189,40 @@ func (a *analyzer) recordCollection(path string, nested, inArray bool) {
 	}
 }
 
-// results produces deterministically ordered FieldSchema entries.
+// results produces deterministically ordered FieldSchema entries with reliable optional-field analysis.
 func (a *analyzer) results() []FieldSchema {
 	paths := make([]string, 0, len(a.entries))
 	for p := range a.entries {
 		paths = append(paths, p)
 	}
 	sort.Strings(paths)
+
+	// Phase 1: Determine direct optionality based on parent scope count
+	for _, p := range paths {
+		e := a.entries[p]
+		parentTotal := a.scopeCounts[e.parentPath]
+		if parentTotal > 0 && e.count < parentTotal {
+			e.optional = true
+		}
+	}
+
+	// Phase 2: Propagate ancestor optionality
+	// If a parent object or array is optional, all fields within it are also optional.
+	// Since paths are sorted lexicographically, shorter ancestor paths come before descendant paths.
+	for _, p := range paths {
+		e := a.entries[p]
+		if e.parentPath != "$" && e.parentPath != "" {
+			if parentEntry, exists := a.entries[e.parentPath]; exists && parentEntry.optional {
+				e.optional = true
+			}
+			if strings.HasSuffix(e.parentPath, "[]") {
+				arrPath := strings.TrimSuffix(e.parentPath, "[]")
+				if arrEntry, exists := a.entries[arrPath]; exists && arrEntry.optional {
+					e.optional = true
+				}
+			}
+		}
+	}
 
 	out := make([]FieldSchema, len(paths))
 	for i, p := range paths {

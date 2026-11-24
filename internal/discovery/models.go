@@ -175,11 +175,13 @@ type CaptureJob struct {
 	ContentType     string
 	ResourceType    string
 	Body            []byte // nil if metadata-only
-	BodySize        int64
+	BodySize        int64  // sanitized body size (or raw size if not sanitized)
+	RawBodySize     int64  // original un-sanitized response body size
 	BodyError       string // set if body retrieval failed
 	HasDateParam    bool
-	Sanitized       bool     // true if credentials were stripped from body
-	SanitizedFields []string // names of sanitized sensitive fields (no values)
+	Sanitized       bool      // true if credentials were stripped from body
+	SanitizedFields []string  // names of sanitized sensitive fields (no values)
+	CapturedAt      time.Time // timestamp when event was captured
 
 	// Barrier coordination
 	IsBarrier   bool

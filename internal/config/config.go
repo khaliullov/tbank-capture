@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Config holds all application configuration loaded from environment variables.
@@ -30,6 +31,10 @@ type Config struct {
 	CaptureQueueSize    int
 	AllowedDomains      []string
 
+	// Response Processing (bounded worker pool)
+	ResponseWorkerCount int
+	ResponseQueueSize   int
+
 	// JSON analysis limits
 	MaxJSONDepth  int
 	MaxArrayElems int
@@ -43,7 +48,9 @@ type Config struct {
 // If a .env file exists in the current directory, it is loaded first.
 // Secrets such as TELEGRAM_BOT_TOKEN are never included in error messages.
 func Load() (*Config, error) {
-	_ = LoadEnv(".env")
+	if err := LoadEnv(".env"); err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("load .env: %w", err)
+	}
 
 	c := &Config{}
 	var err error
@@ -91,6 +98,14 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	c.ResponseWorkerCount, err = envInt("RESPONSE_WORKER_COUNT", 8)
+	if err != nil {
+		return nil, err
+	}
+	c.ResponseQueueSize, err = envInt("RESPONSE_QUEUE_SIZE", 256)
+	if err != nil {
+		return nil, err
+	}
 	c.MaxJSONDepth, err = envInt("MAX_JSON_DEPTH", 32)
 	if err != nil {
 		return nil, err
@@ -117,7 +132,7 @@ func Load() (*Config, error) {
 }
 
 func (c *Config) validate() error {
-	if c.UserDataDir == "" || c.UserDataDir == "." && envIsSet("USER_DATA_DIR") && os.Getenv("USER_DATA_DIR") == "" {
+	if c.UserDataDir == "" || (c.UserDataDir == "." && envIsSet("USER_DATA_DIR") && os.Getenv("USER_DATA_DIR") == "") {
 		return errors.New("USER_DATA_DIR must not be empty")
 	}
 	if c.RawCaptureDir == "" {
@@ -127,11 +142,24 @@ func (c *Config) validate() error {
 		return errors.New("DISCOVERY_DIR must not be empty")
 	}
 
+	// Verify permissions of existing directories
+	for _, dir := range []string{c.UserDataDir, c.RawCaptureDir, c.DiscoveryDir} {
+		if err := CheckDirPermissions(dir); err != nil {
+			return err
+		}
+	}
+
 	if c.MaxResponseBodySize <= 0 {
 		return errors.New("MAX_RESPONSE_BODY_BYTES must be positive")
 	}
 	if c.CaptureQueueSize <= 0 {
 		return errors.New("CAPTURE_QUEUE_SIZE must be positive")
+	}
+	if c.ResponseWorkerCount <= 0 {
+		return errors.New("RESPONSE_WORKER_COUNT must be positive")
+	}
+	if c.ResponseQueueSize <= 0 {
+		return errors.New("RESPONSE_QUEUE_SIZE must be positive")
 	}
 	if c.MaxJSONDepth <= 0 {
 		return errors.New("MAX_JSON_DEPTH must be positive")
@@ -151,6 +179,32 @@ func (c *Config) validate() error {
 	if !validLevels[c.LogLevel] {
 		return fmt.Errorf("LOG_LEVEL must be one of debug/info/warn/error, got: %q", c.LogLevel)
 	}
+	return nil
+}
+
+// CheckDirPermissions checks if an existing path is a directory and has appropriate access permissions.
+// If the directory does not exist, it returns nil (directories may be created on demand).
+// If the directory exists, it verifies that it is a directory and is writable.
+func CheckDirPermissions(dir string) error {
+	info, err := os.Stat(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("stat directory %s: %w", dir, err)
+	}
+
+	if !info.IsDir() {
+		return fmt.Errorf("path %s exists but is not a directory", dir)
+	}
+
+	// Verify directory permissions: test writability by attempting to create and remove a test file
+	testFile := filepath.Join(dir, fmt.Sprintf(".perm_check_%d", time.Now().UnixNano()))
+	if err := os.WriteFile(testFile, []byte("ok"), 0600); err != nil {
+		return fmt.Errorf("directory %s is not writable: %w", dir, err)
+	}
+	_ = os.Remove(testFile)
+
 	return nil
 }
 

@@ -505,7 +505,7 @@ func (c *Collector) ProcessJob(job CaptureJob) {
 
 	structHash := structureHashFromFields(fields)
 	normPath := NormalizePath(extractPath(job.URL))
-	fpID := BuildFingerprintID(job.Method, normPath, job.ContentType, job.ResourceType, topKind, structHash)
+	fpID := BuildFingerprintID(job.Method, normPath, job.ContentType, job.ResourceType, topKind, structHash, job.Status)
 
 	now := time.Now().UTC()
 	fp, exists := c.fingerprints[fpID]
@@ -528,7 +528,7 @@ func (c *Collector) ProcessJob(job CaptureJob) {
 		}
 		c.fingerprints[fpID] = fp
 		c.bodyHashes[fpID] = make(map[string]bool)
-		c.log.Info("new endpoint fingerprint", "id", fpID, "path", normPath)
+		c.log.Info("new endpoint fingerprint", "id", fpID, "path", normPath, "status", job.Status)
 	} else {
 		if job.Sanitized {
 			fp.Sanitized = true
@@ -538,13 +538,20 @@ func (c *Collector) ProcessJob(job CaptureJob) {
 		}
 	}
 
-	// Update fingerprint metrics
+	// Update fingerprint metrics using raw response size for accurate network accounting
 	fp.LastSeen = now
 	fp.Observations++
 	fp.StatusDist[job.Status]++
-	fp.TotalBytes += job.BodySize
-	if job.BodySize > fp.MaxResponseSize {
-		fp.MaxResponseSize = job.BodySize
+
+	respBytes := job.RawBodySize
+	if respBytes <= 0 && job.BodySize > 0 {
+		respBytes = job.BodySize
+	}
+	if respBytes > 0 {
+		fp.TotalBytes += respBytes
+		if respBytes > fp.MaxResponseSize {
+			fp.MaxResponseSize = respBytes
+		}
 	}
 	if job.HasDateParam {
 		fp.HasDateParams = true
@@ -741,9 +748,14 @@ func mergeFields(existing, incoming []FieldSchema, totalObservations int) []Fiel
 	for i, f := range existing {
 		byPath[f.Path] = i
 	}
+	incomingSeen := make(map[string]bool, len(incoming))
 	for _, f := range incoming {
+		incomingSeen[f.Path] = true
 		if idx, ok := byPath[f.Path]; ok {
 			existing[idx].Count += f.Count
+			if f.Optional {
+				existing[idx].Optional = true
+			}
 			typeSet := map[string]bool{}
 			for _, t := range existing[idx].ObservedTypes {
 				typeSet[t] = true
@@ -754,15 +766,20 @@ func mergeFields(existing, incoming []FieldSchema, totalObservations int) []Fiel
 				}
 			}
 		} else {
+			if totalObservations > 1 {
+				f.Optional = true
+			}
 			existing = append(existing, f)
 			byPath[f.Path] = len(existing) - 1
 		}
 	}
 
-	// Update optionality across observations: if a field was not present in all observations
-	for i := range existing {
-		if totalObservations > 1 && existing[i].Count < totalObservations {
-			existing[i].Optional = true
+	// Update optionality across observations: if a field was not present in this observation
+	if totalObservations > 1 {
+		for i := range existing {
+			if !incomingSeen[existing[i].Path] {
+				existing[i].Optional = true
+			}
 		}
 	}
 

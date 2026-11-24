@@ -59,15 +59,17 @@ func isDynamicSegment(s string) bool {
 }
 
 // BuildFingerprintID creates a stable opaque ID from the components that define
-// an endpoint family. It is intentionally independent of response values and query parameters.
-func BuildFingerprintID(method, normalizedPath, contentType, resourceType string, topLevelKind JSONKind, structureHash string) FingerprintID {
-	raw := fmt.Sprintf("%s|%s|%s|%s|%s|%s",
+// an endpoint family, including HTTP status code for fingerprint completeness.
+// It is intentionally independent of response values and query parameters.
+func BuildFingerprintID(method, normalizedPath, contentType, resourceType string, topLevelKind JSONKind, structureHash string, status int) FingerprintID {
+	raw := fmt.Sprintf("%s|%s|%s|%s|%s|%s|%d",
 		strings.ToUpper(strings.TrimSpace(method)),
 		strings.TrimSpace(normalizedPath),
 		strings.ToLower(strings.TrimSpace(contentType)),
 		strings.ToLower(strings.TrimSpace(resourceType)),
 		string(topLevelKind),
 		structureHash,
+		status,
 	)
 	sum := sha256.Sum256([]byte(raw))
 	return FingerprintID(hex.EncodeToString(sum[:8]))

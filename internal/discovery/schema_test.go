@@ -179,9 +179,9 @@ func TestSameStructureSameHash(t *testing.T) {
 	}
 
 	fp1 := discovery.BuildFingerprintID("GET", "/api/v1/transactions",
-		"application/json", "xhr", kind1, hashFields(fields1))
+		"application/json", "xhr", kind1, hashFields(fields1), 200)
 	fp2 := discovery.BuildFingerprintID("GET", "/api/v1/transactions",
-		"application/json", "xhr", kind2, hashFields(fields2))
+		"application/json", "xhr", kind2, hashFields(fields2), 200)
 
 	if fp1 != fp2 {
 		t.Errorf("same structure produced different fingerprints:\n  %s\n  %s", fp1, fp2)
@@ -197,9 +197,9 @@ func TestDifferentStructureDifferentHash(t *testing.T) {
 	fields2, kind2, _ := discovery.AnalyzeJSON(body2, cfg())
 
 	fp1 := discovery.BuildFingerprintID("GET", "/api/v1/transactions",
-		"application/json", "xhr", kind1, hashFields(fields1))
+		"application/json", "xhr", kind1, hashFields(fields1), 200)
 	fp2 := discovery.BuildFingerprintID("GET", "/api/v1/transactions",
-		"application/json", "xhr", kind2, hashFields(fields2))
+		"application/json", "xhr", kind2, hashFields(fields2), 200)
 
 	if fp1 == fp2 {
 		t.Error("different structures produced the same fingerprint")
@@ -215,9 +215,9 @@ func TestKeyOrderIndependence(t *testing.T) {
 	fields2, kind2, _ := discovery.AnalyzeJSON(body2, cfg())
 
 	fp1 := discovery.BuildFingerprintID("GET", "/api/v1/transactions",
-		"application/json", "xhr", kind1, hashFields(fields1))
+		"application/json", "xhr", kind1, hashFields(fields1), 200)
 	fp2 := discovery.BuildFingerprintID("GET", "/api/v1/transactions",
-		"application/json", "xhr", kind2, hashFields(fields2))
+		"application/json", "xhr", kind2, hashFields(fields2), 200)
 
 	if fp1 != fp2 {
 		t.Errorf("key order changed fingerprint: %s != %s", fp1, fp2)
@@ -356,4 +356,122 @@ func hashFields(fields []discovery.FieldSchema) string {
 	}
 	sum := sha256.Sum256([]byte(sb.String()))
 	return hex.EncodeToString(sum[:8])
+}
+
+func assertFieldRequired(t *testing.T, fields []discovery.FieldSchema, path string) {
+	t.Helper()
+	for _, f := range fields {
+		if f.Path == path {
+			if f.Optional {
+				t.Errorf("field %q was marked optional, expected required", path)
+			}
+			return
+		}
+	}
+	t.Errorf("field %q not found in schema", path)
+}
+
+func assertFieldOptional(t *testing.T, fields []discovery.FieldSchema, path string) {
+	t.Helper()
+	for _, f := range fields {
+		if f.Path == path {
+			if !f.Optional {
+				t.Errorf("field %q was marked required, expected optional", path)
+			}
+			return
+		}
+	}
+	t.Errorf("field %q not found in schema", path)
+}
+
+func TestAnalyzeJSON_OptionalFieldsComprehensive(t *testing.T) {
+	// 1. Required and optional fields in array of objects
+	data1 := []byte(`{
+		"status": "ok",
+		"items": [
+			{"id": "1", "name": "Item 1", "description": "desc 1"},
+			{"id": "2", "name": "Item 2"}
+		]
+	}`)
+	fields1, _, err := discovery.AnalyzeJSON(data1, cfg())
+	if err != nil {
+		t.Fatalf("AnalyzeJSON data1: %v", err)
+	}
+	assertFieldRequired(t, fields1, "$.status")
+	assertFieldRequired(t, fields1, "$.items")
+	assertFieldRequired(t, fields1, "$.items[].id")
+	assertFieldRequired(t, fields1, "$.items[].name")
+	assertFieldOptional(t, fields1, "$.items[].description") // missing in item 2
+
+	// 2. Nested optional fields
+	data2 := []byte(`{
+		"items": [
+			{"id": 1, "card": {"pan": "*1234", "exp": "12/28"}},
+			{"id": 2, "card": {"pan": "*5678"}},
+			{"id": 3}
+		]
+	}`)
+	fields2, _, err := discovery.AnalyzeJSON(data2, cfg())
+	if err != nil {
+		t.Fatalf("AnalyzeJSON data2: %v", err)
+	}
+	assertFieldRequired(t, fields2, "$.items[].id")
+	assertFieldOptional(t, fields2, "$.items[].card")     // missing in item 3
+	assertFieldOptional(t, fields2, "$.items[].card.pan") // missing in item 3
+	assertFieldOptional(t, fields2, "$.items[].card.exp") // missing in item 2 & 3
+
+	// 3. Different array objects
+	data3 := []byte(`{
+		"records": [
+			{"type": "A", "valA": 10},
+			{"type": "B", "valB": "twenty"}
+		]
+	}`)
+	fields3, _, err := discovery.AnalyzeJSON(data3, cfg())
+	if err != nil {
+		t.Fatalf("AnalyzeJSON data3: %v", err)
+	}
+	assertFieldRequired(t, fields3, "$.records[].type")
+	assertFieldOptional(t, fields3, "$.records[].valA")
+	assertFieldOptional(t, fields3, "$.records[].valB")
+
+	// 4. Empty arrays
+	data4 := []byte(`{"results": []}`)
+	fields4, _, err := discovery.AnalyzeJSON(data4, cfg())
+	if err != nil {
+		t.Fatalf("AnalyzeJSON data4: %v", err)
+	}
+	assertFieldRequired(t, fields4, "$.results")
+
+	// 5. Truncated array inspection
+	customCfg := discovery.AnalyzerConfig{MaxDepth: 10, MaxArrayElems: 2, MaxFields: 100}
+	data5 := []byte(`{
+		"list": [
+			{"id": 1, "common": "x"},
+			{"id": 2, "common": "y"},
+			{"id": 3}
+		]
+	}`)
+	fields5, _, err := discovery.AnalyzeJSON(data5, customCfg)
+	if err != nil {
+		t.Fatalf("AnalyzeJSON data5: %v", err)
+	}
+	// Since MaxArrayElems is 2, only first 2 items are inspected. Both have "common".
+	assertFieldRequired(t, fields5, "$.list[].id")
+	assertFieldRequired(t, fields5, "$.list[].common")
+
+	// But if one of the first 2 items omits "note":
+	data6 := []byte(`{
+		"list": [
+			{"id": 1, "note": "x"},
+			{"id": 2},
+			{"id": 3, "note": "z"}
+		]
+	}`)
+	fields6, _, err := discovery.AnalyzeJSON(data6, customCfg)
+	if err != nil {
+		t.Fatalf("AnalyzeJSON data6: %v", err)
+	}
+	assertFieldRequired(t, fields6, "$.list[].id")
+	assertFieldOptional(t, fields6, "$.list[].note")
 }
