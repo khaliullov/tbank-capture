@@ -307,6 +307,12 @@ func TestFilter_CheckEligiblePath_Detailed(t *testing.T) {
 		{"https://tbank.ru/auth/challenge", false},
 		{"https://tbank.ru/api/common/v1/session/check_auth", false},
 		{"https://tbank.ru/api/common/v3/navigation/auth/validate", false},
+		{"https://www.tbank.ru/api/common/v1/session_status", false},
+		{"https://www.tbank.ru/api/common/v1/auth/short_personal_info", false},
+		{"https://www.tbank.ru/api/messenger/tmsg/app/bank/api/v1/session/validate", false},
+		{"https://www.tbank.ru/pin/verify", false},
+		{"https://www.tbank.ru/challenge/otp", false},
+		{"https://www.tbank.ru/captcha/solve", false},
 
 		// Business endpoints: MUST BE PRESERVED
 		{"https://tbank.ru/api/v1/accounts", true},

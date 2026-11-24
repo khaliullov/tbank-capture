@@ -127,9 +127,12 @@ func (f *Filter) CheckEligiblePath(rawURL string) (bool, discovery.RejectionReas
 
 	for i, part := range parts {
 		seg := strings.ToLower(strings.TrimSpace(part))
-		// Standalone auth actions
+		// Standalone auth actions and credential paths
 		switch seg {
-		case "login", "signin", "sign-in", "logout", "signout", "sign-out", "saml", "sso", "webauthn", "2fa", "mfa", "preidentity", "identity", "passkey":
+		case "login", "signin", "sign-in", "logout", "signout", "sign-out", "saml", "sso",
+			"webauthn", "2fa", "mfa", "preidentity", "identity", "passkey",
+			"pin", "pincode", "otp", "challenge", "captcha",
+			"session_status", "session-status", "sessionstatus":
 			return false, discovery.ReasonExcludedAuthPath
 		case "oauth", "oidc", "passport":
 			// If subsequent segment is token, authorize, login, auth, sms, otp, code, callback, step
@@ -145,17 +148,9 @@ func (f *Filter) CheckEligiblePath(rawURL string) (bool, discovery.RejectionReas
 				return false, discovery.ReasonExcludedAuthPath
 			}
 		case "auth":
-			// If subsequent segment is login, token, refresh, otp, sms, verify, confirm, step, pin, challenge, validate
-			if i+1 < len(parts) {
-				next := strings.ToLower(strings.TrimSpace(parts[i+1]))
-				switch next {
-				case "login", "token", "refresh", "otp", "sms", "verify", "confirm", "code", "step", "pin", "pincode", "challenge", "status", "validate":
-					return false, discovery.ReasonExcludedAuthPath
-				}
-			} else {
-				// /auth as terminal endpoint
-				return false, discovery.ReasonExcludedAuthPath
-			}
+			// Any /auth segment represents an authentication workflow endpoint.
+			// (Plural "authorizations" for card holds is separate and preserved).
+			return false, discovery.ReasonExcludedAuthPath
 		case "session":
 			// /session alone is often session creation/login check
 			// BUT /session/accounts, /session/user, /session/products, /session/cards, etc. are business endpoints!
@@ -164,7 +159,8 @@ func (f *Filter) CheckEligiblePath(rawURL string) (bool, discovery.RejectionReas
 			}
 			next := strings.ToLower(strings.TrimSpace(parts[i+1]))
 			switch next {
-			case "login", "logout", "authenticate", "auth", "confirm", "create", "start", "check_auth", "validate":
+			case "login", "logout", "authenticate", "auth", "confirm", "create", "start",
+				"check_auth", "validate", "status", "check", "state", "init", "ping":
 				return false, discovery.ReasonExcludedAuthPath
 			}
 		case "authorize":
