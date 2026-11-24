@@ -298,6 +298,15 @@ func TestFilter_CheckEligiblePath_Detailed(t *testing.T) {
 		{"https://tbank.ru/passport/login", false},
 		{"https://tbank.ru/sso/callback", false},
 		{"https://tbank.ru/2fa/verify", false},
+		{"https://id.tbank.ru/auth/step", false},
+		{"https://id.tbank.ru/auth/.well-known/openid-configuration", false},
+		{"https://id.tbank.ru/preidentity/api/v1/user-info", false},
+		{"https://passport.tbank.ru/auth/pin", false},
+		{"https://tbank.ru/auth/step", false},
+		{"https://tbank.ru/auth/pin", false},
+		{"https://tbank.ru/auth/challenge", false},
+		{"https://tbank.ru/api/common/v1/session/check_auth", false},
+		{"https://tbank.ru/api/common/v3/navigation/auth/validate", false},
 
 		// Business endpoints: MUST BE PRESERVED
 		{"https://tbank.ru/api/v1/accounts", true},

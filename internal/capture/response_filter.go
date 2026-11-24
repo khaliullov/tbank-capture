@@ -109,6 +109,16 @@ func (f *Filter) CheckEligiblePath(rawURL string) (bool, discovery.RejectionReas
 	if err != nil {
 		return false, discovery.ReasonMalformedURL
 	}
+
+	host := strings.ToLower(strings.TrimSpace(u.Hostname()))
+	host = strings.TrimSuffix(host, ".")
+	// Exclude dedicated authentication and identity domains
+	if host == "id.tbank.ru" || host == "passport.tbank.ru" || host == "auth.tbank.ru" || host == "sso.tbank.ru" ||
+		host == "id.tinkoff.ru" || host == "passport.tinkoff.ru" || host == "auth.tinkoff.ru" || host == "sso.tinkoff.ru" ||
+		strings.HasPrefix(host, "id.") || strings.HasPrefix(host, "passport.") || strings.HasPrefix(host, "sso.") {
+		return false, discovery.ReasonExcludedAuthPath
+	}
+
 	clean := path.Clean("/" + u.Path)
 	parts := strings.Split(strings.Trim(clean, "/"), "/")
 	if len(parts) == 0 || (len(parts) == 1 && parts[0] == "") {
@@ -119,14 +129,14 @@ func (f *Filter) CheckEligiblePath(rawURL string) (bool, discovery.RejectionReas
 		seg := strings.ToLower(strings.TrimSpace(part))
 		// Standalone auth actions
 		switch seg {
-		case "login", "signin", "sign-in", "logout", "signout", "sign-out", "saml", "sso", "webauthn", "2fa", "mfa":
+		case "login", "signin", "sign-in", "logout", "signout", "sign-out", "saml", "sso", "webauthn", "2fa", "mfa", "preidentity", "identity", "passkey":
 			return false, discovery.ReasonExcludedAuthPath
 		case "oauth", "oidc", "passport":
-			// If subsequent segment is token, authorize, login, auth, sms, otp, code, callback
+			// If subsequent segment is token, authorize, login, auth, sms, otp, code, callback, step
 			if i+1 < len(parts) {
 				next := strings.ToLower(strings.TrimSpace(parts[i+1]))
 				switch next {
-				case "token", "authorize", "login", "auth", "sms", "otp", "code", "callback":
+				case "token", "authorize", "login", "auth", "sms", "otp", "code", "callback", "step", "user-info":
 					return false, discovery.ReasonExcludedAuthPath
 				}
 			}
@@ -135,11 +145,11 @@ func (f *Filter) CheckEligiblePath(rawURL string) (bool, discovery.RejectionReas
 				return false, discovery.ReasonExcludedAuthPath
 			}
 		case "auth":
-			// If subsequent segment is login, token, refresh, otp, sms, verify, confirm
+			// If subsequent segment is login, token, refresh, otp, sms, verify, confirm, step, pin, challenge, validate
 			if i+1 < len(parts) {
 				next := strings.ToLower(strings.TrimSpace(parts[i+1]))
 				switch next {
-				case "login", "token", "refresh", "otp", "sms", "verify", "confirm", "code":
+				case "login", "token", "refresh", "otp", "sms", "verify", "confirm", "code", "step", "pin", "pincode", "challenge", "status", "validate":
 					return false, discovery.ReasonExcludedAuthPath
 				}
 			} else {
@@ -154,7 +164,7 @@ func (f *Filter) CheckEligiblePath(rawURL string) (bool, discovery.RejectionReas
 			}
 			next := strings.ToLower(strings.TrimSpace(parts[i+1]))
 			switch next {
-			case "login", "logout", "authenticate", "auth", "confirm", "create", "start":
+			case "login", "logout", "authenticate", "auth", "confirm", "create", "start", "check_auth", "validate":
 				return false, discovery.ReasonExcludedAuthPath
 			}
 		case "authorize":

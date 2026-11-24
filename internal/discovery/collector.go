@@ -476,9 +476,9 @@ func (c *Collector) ProcessJob(job CaptureJob) {
 	var warnings []string
 	if job.BodyError != "" {
 		hasError = true
-		warningMsg := fmt.Sprintf("body retrieval failed: %s", job.BodyError)
+		warningMsg := fmt.Sprintf("body retrieval failed: %s", sanitizeWarning(job.BodyError))
 		warnings = append(warnings, warningMsg)
-		c.log.Debug("body retrieval issue", "url", sanitizeURLForLog(job.URL), "err", job.BodyError)
+		c.log.Debug("body retrieval issue", "url", sanitizeURLForLog(job.URL), "err", sanitizeWarning(job.BodyError))
 	}
 
 	// Analyze JSON structure if body is available.
@@ -489,9 +489,9 @@ func (c *Collector) ProcessJob(job CaptureJob) {
 		fields, topKind, err = AnalyzeJSON(job.Body, c.analyzerCfg)
 		if err != nil {
 			hasError = true
-			warningMsg := fmt.Sprintf("json analysis error: %s", err)
+			warningMsg := fmt.Sprintf("json analysis error: %s", sanitizeWarning(err.Error()))
 			warnings = append(warnings, warningMsg)
-			c.log.Debug("json analysis issue", "err", err)
+			c.log.Debug("json analysis issue", "err", sanitizeWarning(err.Error()))
 		}
 	}
 
@@ -713,6 +713,19 @@ func stripQueryAndCreds(rawURL string) string {
 
 func sanitizeURLForLog(rawURL string) string {
 	return stripQueryAndCreds(rawURL)
+}
+
+func sanitizeWarning(msg string) string {
+	if msg == "" {
+		return ""
+	}
+	words := strings.Fields(msg)
+	for i, w := range words {
+		if strings.HasPrefix(w, "http://") || strings.HasPrefix(w, "https://") {
+			words[i] = stripQueryAndCreds(w)
+		}
+	}
+	return strings.Join(words, " ")
 }
 
 func hasPaginationSignal(fields []FieldSchema) bool {

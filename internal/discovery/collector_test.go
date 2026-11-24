@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -281,6 +282,60 @@ func TestCollector_RepeatedSessionPersistenceAndNoOverwrite(t *testing.T) {
 
 	if len(sessionFiles) != numSessions {
 		t.Errorf("expected %d distinct session files, got %d", numSessions, len(sessionFiles))
+	}
+}
+
+// TestCollector_SensitiveErrorSanitization verifies that query strings and authentication
+// secrets cannot enter endpoint capture warnings or generated reports through error messages.
+func TestCollector_SensitiveErrorSanitization(t *testing.T) {
+	sessionDir := t.TempDir()
+	reportDir := t.TempDir()
+	cfg := discovery.DefaultAnalyzerConfig()
+	col := discovery.NewCollector(testLogger(), sessionDir, cfg)
+	gen := discovery.NewGenerator(reportDir)
+
+	id := discovery.NewSessionID()
+	col.StartSession(id)
+
+	sensitiveErr := "request failed: https://api.tbank.ru/fail?token=SECRET_AUTH_TOKEN_VALUE&pin=8390#frag"
+	col.ProcessJob(discovery.CaptureJob{
+		SessionID:    id,
+		Method:       "GET",
+		URL:          "https://api.tbank.ru/fail?token=SECRET_AUTH_TOKEN_VALUE&pin=8390",
+		Status:       502,
+		ContentType:  "application/json",
+		ResourceType: "xhr",
+		Body:         nil,
+		BodyError:    sensitiveErr,
+	})
+
+	sessCopy, fps, metrics, err := col.FinalizeSession(id)
+	if err != nil {
+		t.Fatalf("finalize session: %v", err)
+	}
+
+	for _, fp := range fps {
+		for _, w := range fp.CaptureWarnings {
+			if strings.Contains(w, "SECRET_AUTH_TOKEN_VALUE") || strings.Contains(w, "pin=8390") || strings.Contains(w, "?") {
+				t.Fatalf("sensitive parameter leaked in capture warning: %q", w)
+			}
+		}
+	}
+
+	mdPath, jsonPath, err := gen.Generate(sessCopy, fps, metrics)
+	if err != nil {
+		t.Fatalf("generate report: %v", err)
+	}
+
+	for _, path := range []string{mdPath, jsonPath} {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		content := string(data)
+		if strings.Contains(content, "SECRET_AUTH_TOKEN_VALUE") || strings.Contains(content, "pin=8390") {
+			t.Fatalf("sensitive secret leaked in report %s", path)
+		}
 	}
 }
 
